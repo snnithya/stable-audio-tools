@@ -722,10 +722,12 @@ class DiffusionCondDemoCallback(pl.Callback):
                 fakes = rearrange(fakes, 'b d n -> d (b n)')
 
                 filename = f'demo_cfg_{cfg_scale}_{trainer.global_step:08}.wav'
-                fakes_out = fakes.to(torch.float32).div(torch.max(torch.abs(fakes))).mul(32767).to(torch.int16).cpu()
+                fakes_out = fakes.to(torch.float32)
+                # normalize
+                fakes_out = fakes_out.div(torch.max(torch.abs(fakes_out))).cpu()
                 torchaudio.save(filename, fakes_out, self.sample_rate)
                 log_audio(trainer.logger, f'demo_cfg_{cfg_scale}', filename, self.sample_rate)                
-                log_image(trainer.logger, f'demo_melspec_left_cfg_{cfg_scale}', audio_spectrogram_image(fakes_out))
+                log_image(trainer.logger, f'demo_melspec_left_cfg_{cfg_scale}', audio_spectrogram_image(fakes_out.div(torch.max(torch.abs(fakes_out))).mul(32767).to(torch.int16)))
             
                 # Mid-generation conditioning display
                 if self.cond_display_configs is not None:

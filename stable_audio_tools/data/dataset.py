@@ -117,7 +117,7 @@ def get_latent_filenames(
     if type(paths) is str:
         paths = [paths]
     for path in paths:               # get a list of relevant filenames
-
+        print(path, extensions)
         # Check for filelist.txt at the root of the directory
         filelist_path = path + "/filelist.txt"
         if os.path.exists(filelist_path):
@@ -136,11 +136,15 @@ class LocalDatasetConfig:
         self,
         id: str,
         path: str,
-        custom_metadata_fn: Optional[Callable[[str], str]] = None
+        custom_metadata_fn: Optional[Callable[[str], str]] = None,
+        latent_extension: str = "npy",
+        whitelist_pth: Optional[str] = None,
     ):
         self.id = id
         self.path = path
         self.custom_metadata_fn = custom_metadata_fn
+        self.latent_extension = latent_extension
+        self.whitelist_pth = whitelist_pth
 
 class SampleDataset(torch.utils.data.Dataset):
     def __init__(
@@ -280,9 +284,21 @@ class PreEncodedDataset(torch.utils.data.Dataset):
         self.latent_extension = latent_extension
 
         for config in configs:
-            self.filenames.extend(get_latent_filenames(config.path, [latent_extension]))
+            cur_files = get_latent_filenames(config.path, [config.latent_extension])
+            # self.filenames.extend(get_latent_filenames(config.path, [config.latent_extension]))
             if config.custom_metadata_fn is not None:
                 self.custom_metadata_fns[config.path] = config.custom_metadata_fn
+            whitelist_pth = config.whitelist_pth
+            if whitelist_pth is not None:
+                with open(whitelist_pth, "r") as f:
+                    whitelist = f.read().splitlines()
+                whitelist = set([x.split(".")[0] for x in whitelist])
+                cur_files = [fn for fn in cur_files if os.path.splitext(os.path.basename(fn))[0] in whitelist]
+                print(f"After applying whitelist of {len(whitelist)} items, {len(cur_files)} files remain.")
+            else:
+                print(f"found {len(cur_files)} files in dataset {config.id} at {config.path}")
+            self.filenames += cur_files
+
 
         self.latent_crop_length = latent_crop_length
         self.random_crop = random_crop
@@ -298,15 +314,22 @@ class PreEncodedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         latent_filename = self.filenames[idx]
         try:
-            latents = torch.from_numpy(np.load(latent_filename)) # [C, N]
+            latent_extension = latent_filename.split(".")[-1]
+            if latent_extension == "pt":
+                latents = torch.load(latent_filename)  # [C, N]
+            else:
+                latents = torch.from_numpy(np.load(latent_filename)) # [C, N]
 
-            md_filename = latent_filename.replace(f".{self.latent_extension}", ".json")
+            md_filename = latent_filename.replace(f".{latent_extension}", ".json")
 
             with open(md_filename, "r") as f:
                 try:
                     info = json.load(f)
                 except:
                     raise Exception(f"Couldn't load metadata file {md_filename}")
+                
+            if "padding_mask" not in info:
+                info["padding_mask"] = [1] * latents.shape[-1]
 
             info["latent_filename"] = latent_filename
 
@@ -328,7 +351,10 @@ class PreEncodedDataset(torch.utils.data.Dataset):
                 info["latent_crop_start"] = start
 
             info["padding_mask"] = [torch.tensor(info["padding_mask"])]
-
+            if "seconds_total" not in info:
+                info["seconds_total"] = int(latents.size(1) * 2048 / info["sample_rate"])
+            if "seconds_start" not in info:
+                info["seconds_start"] = int(info.get("starting_point", 0) / info["sample_rate"]) + start * 2048 / info["sample_rate"]
             seconds_total = info["seconds_total"]
 
             if self.min_length_sec is not None and seconds_total < self.min_length_sec:
@@ -884,7 +910,9 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
                 LocalDatasetConfig(
                     id=pre_encoded_dir_config["id"],
                     path=pre_encoded_dir_path,
-                    custom_metadata_fn=custom_metadata_fn
+                    custom_metadata_fn=custom_metadata_fn,
+                    latent_extension=pre_encoded_dir_config.get("latent_extension", 'npy'),
+                    whitelist_pth=pre_encoded_dir_config.get("whitelist_pth", None)
                 )
             )
 
