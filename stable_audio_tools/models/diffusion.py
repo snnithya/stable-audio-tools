@@ -220,7 +220,13 @@ class ConditionedDiffusionModelWrapper(nn.Module):
                 # for key in input_add_cond.keys():
                 #     if key not in ['inpaint_masked_input', 'inpaint_mask']:
                 #         input_add_cond[key] = input_add_cond[key] * (1 - inpaint_mask.float())
-                # use input_add_ids (which is a list of tuples (key, n_dims))
+                # use input_add_ids (which is a list of tuples (key, n_dims)) to index into which
+                # channels of input_add_cond to mask
+                start_idx = 0
+                for key, n_dims in self.input_add_ids:
+                    if key not in ['inpaint_masked_input', 'inpaint_mask']:
+                        input_add_cond[:, start_idx:start_idx + n_dims, :] = input_add_cond[:, start_idx:start_idx + n_dims, :] * (1 - inpaint_mask.float())
+                    start_idx += n_dims
 
 
         if negative:
