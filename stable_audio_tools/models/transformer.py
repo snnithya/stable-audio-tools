@@ -801,6 +801,7 @@ class ContinuousTransformer(nn.Module):
         return_info = False,
         use_checkpointing = True,
         exit_layer_ix = None,
+        input_add_emb = None,
         **kwargs
     ):
         batch, seq, device = *x.shape[:2], x.device
@@ -813,6 +814,9 @@ class ContinuousTransformer(nn.Module):
         }
 
         x = self.project_in(x)
+
+        if input_add_emb is not None:
+            x = x + input_add_emb
 
         if prepend_embeds is not None:
             prepend_length, prepend_dim = prepend_embeds.shape[1:]
