@@ -8,6 +8,7 @@ from torch import nn, einsum
 from torch.amp import autocast
 from typing import Callable, Literal
 from torch.nn.attention.flex_attention import flex_attention
+import os
 
 try:
     from flash_attn import flash_attn_func
@@ -805,6 +806,8 @@ class ContinuousTransformer(nn.Module):
         **kwargs
     ):
         batch, seq, device = *x.shape[:2], x.device
+
+        use_checkpointing = os.environ.get('USE_CHECKPOINTING', '1') == '1' and use_checkpointing
 
         model_dtype = next(self.parameters()).dtype
         x = x.to(model_dtype)

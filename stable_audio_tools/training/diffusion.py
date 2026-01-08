@@ -436,7 +436,6 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
             conditioning['inpaint_mask'] = [inpaint_mask]
             conditioning['inpaint_masked_input'] = [inpaint_masked_input]
-
         output = self.diffusion(noised_inputs, t, cond=conditioning, cfg_dropout_prob = self.cfg_dropout_prob, **extra_args)
         p.tick("diffusion")
 
@@ -656,6 +655,16 @@ class DiffusionCondDemoCallback(pl.Callback):
             print("Getting conditioning")
             with torch.cuda.amp.autocast():
                 conditioning = module.diffusion.conditioner(demo_cond, module.device)
+
+            if module.inpainting_config is not None:
+
+                padding_masks = torch.stack([md["padding_mask"][0] for md in demo_cond], dim=0).to(module.device) # Shape (batch_size, sequence_length)
+
+                # Create a mask of random length for a random slice of the input
+                inpaint_masked_input, inpaint_mask = random_inpaint_mask(batch[0][:self.num_demos], padding_masks=padding_masks, **module.inpaint_mask_kwargs)
+
+                conditioning['inpaint_mask'] = [inpaint_mask]
+                conditioning['inpaint_masked_input'] = [inpaint_masked_input]
 
             cond_inputs = module.diffusion.get_conditioning_inputs(conditioning)
 

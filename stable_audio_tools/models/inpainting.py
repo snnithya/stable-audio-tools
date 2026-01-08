@@ -13,6 +13,7 @@ def random_inpaint_mask(
     padding_masks: torch.Tensor,
     max_mask_segments: int = 10,
     mask_type_probabilities: Optional[List[float]] = None,
+    fixed_mask_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generates random inpainting masks for a batch of latent audio sequences.
@@ -85,7 +86,10 @@ def random_inpaint_mask(
             elif current_mask_type == MaskType.CAUSAL_MASK:
                 # Keep a prefix of real data, inpaint the suffix.
                 # The length of the unmasked prefix can be from 0 to real_sequence_length.
-                unmasked_prefix_len = random.randint(0, real_sequence_length)
+                if fixed_mask_size is None:
+                    unmasked_prefix_len = random.randint(0, real_sequence_length)
+                else:
+                    unmasked_prefix_len = fixed_mask_size
                 
                 if unmasked_prefix_len < real_sequence_length:
                     item_mask[:, :, unmasked_prefix_len:real_sequence_length] = 0

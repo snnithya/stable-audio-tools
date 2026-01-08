@@ -117,7 +117,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
             global_cond_ids: tp.List[str] = [],
             input_concat_ids: tp.List[str] = [],
             prepend_cond_ids: tp.List[str] = [],
-            input_add_ids: tp.List[tuple[str, int]] = [],
+            input_add_ids: tp.List[tp.List[tp.Union[str, int]]] = [],
             ):
         super().__init__()
 
@@ -213,20 +213,20 @@ class ConditionedDiffusionModelWrapper(nn.Module):
             prepend_cond_mask = torch.cat(prepend_cond_masks, dim=1)
 
 
-        if 'inpaint_mask' in conditioning_tensors:
-            # mask other input add conds with complement of inpaint mask, if its not inpaint_masked_input
-            inpaint_mask = conditioning_tensors['inpaint_mask'][0]
-            if input_add_cond is not None:
-                # for key in input_add_cond.keys():
-                #     if key not in ['inpaint_masked_input', 'inpaint_mask']:
-                #         input_add_cond[key] = input_add_cond[key] * (1 - inpaint_mask.float())
-                # use input_add_ids (which is a list of tuples (key, n_dims)) to index into which
-                # channels of input_add_cond to mask
-                start_idx = 0
-                for key, n_dims in self.input_add_ids:
-                    if key not in ['inpaint_masked_input', 'inpaint_mask']:
-                        input_add_cond[:, start_idx:start_idx + n_dims, :] = input_add_cond[:, start_idx:start_idx + n_dims, :] * (1 - inpaint_mask.float())
-                    start_idx += n_dims
+        # if 'inpaint_mask' in conditioning_tensors:
+        #     # mask other input add conds with complement of inpaint mask, if its not inpaint_masked_input
+        #     inpaint_mask = conditioning_tensors['inpaint_mask'][0]
+        #     if input_add_cond is not None:
+        #         # for key in input_add_cond.keys():
+        #         #     if key not in ['inpaint_masked_input', 'inpaint_mask']:
+        #         #         input_add_cond[key] = input_add_cond[key] * (1 - inpaint_mask.float())
+        #         # use input_add_ids (which is a list of tuples (key, n_dims)) to index into which
+        #         # channels of input_add_cond to mask
+        #         start_idx = 0
+        #         for key, n_dims in self.input_add_ids:
+        #             if key not in ['inpaint_masked_input', 'inpaint_mask']:
+        #                 input_add_cond[:, start_idx:start_idx + n_dims, :] = input_add_cond[:, start_idx:start_idx + n_dims, :] * (1 - inpaint_mask.float())
+        #             start_idx += n_dims
 
 
         if negative:

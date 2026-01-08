@@ -2,35 +2,36 @@ export REPO_ROOT="/home/zachary/code/stable-audio-tools/stable_audio_tools"
 
 # export MODEL_CONFIG="/home/zachary/code/sat-sony/saos_base_model_config.json"
 # export MODEL_CONFIG="/home/zachary/code/sat-sony/saos_debug.json"
-export MODEL_CONFIG="/home/zachary/code/sat-sony/saos_debug_start.json"
+# export MODEL_CONFIG="/home/zachary/code/sat-sony/saos_debug_start.json"
+export MODEL_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/model_configs/txt2audio/saos_start_inpaint.json"
 # export MODEL_CONFIG="/home/zachary/code/sat-sony/sao_base_model_config.json"
 
 # export DATASET_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/dataset_configs/ossl2_preextract.json"
 # export DATASET_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/dataset_configs/jamendo_preextract.json"
-# export DATASET_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/dataset_configs/jamendo_ossl2_preextract.json"
-export DATASET_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/dataset_configs/jamendo_ossl2_preextract_longer.json"
+export DATASET_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/dataset_configs/jamendo_ossl2_preextract.json"
+# export DATASET_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/dataset_configs/jamendo_ossl2_preextract_longer.json"
 # export DATASET_CONFIG="/home/zachary/code/sat-sony/stable_audio_tools/configs/dataset_configs/ossl2_preextract_long.json"
 
 
 
 
 # export SCRIPT_CONFIG="$REPO_ROOT/defaults.ini"
-export PRETRAINED_CKPT_PATH="/home/zachary/.cache/huggingface/hub/models--stabilityai--stable-audio-open-small/snapshots/dc620d91535857b72ebb59b4ca45978db6d417f5/base_model.ckpt"
+export PRETRAINED_CKPT_PATH="/home/zachary/code/stable-audio-tools/saos_vgm_jam_800k.ckpt"
 # export PRETRAINED_CKPT_PATH="/home/zachary/.cache/huggingface/hub/models--stabilityai--stable-audio-open-1.0/snapshots/f21265c1e2710b3bd2386596943f0007f55f802e/model.safetensors"
 export SAVE_DIR="/home/zachary/checkpoints/s2s"
 
-export CKPT_PATH="/home/zachary/checkpoints/s2s/ossl2_experiments/l0hvqvix/checkpoints/epoch=352-step=810000.ckpt"
-# export CKPT_PATH=""
+# export CKPT_PATH="/home/zachary/checkpoints/s2s/ossl2_experiments/l0hvqvix/checkpoints/epoch=352-step=810000.ckpt"
+export CKPT_PATH=""
 export ENABLE_TORCH_COMPILE="0"
+export USE_CHECKPOINTING="0"
 
-CUDA_VISIBLE_DEVICES=0,1 python train.py \
+CUDA_VISIBLE_DEVICES=2,3 python train.py \
         --model-config $MODEL_CONFIG \
         --dataset-config $DATASET_CONFIG \
         --config-file /home/zachary/code/stable-audio-tools/defaults.ini \
         --pretrained-ckpt-path $PRETRAINED_CKPT_PATH \
-        --ckpt-path $CKPT_PATH \
         --save-dir $SAVE_DIR \
         --num-workers 128 --strategy ddp_find_unused_parameters_true --accum-batches 1 \
-        --batch-size 64 --checkpoint-every 5000 --precision 16-mixed --name "ossl2_experiments"
+        --batch-size 64 --checkpoint-every 5000 --precision 16-mixed --name "ossl2_experiments" # --ckpt-path $CKPT_PATH \
 
 

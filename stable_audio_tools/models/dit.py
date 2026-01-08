@@ -84,7 +84,7 @@ class DiffusionTransformer(nn.Module):
                 nn.Linear(embed_dim, embed_dim, bias=False)
             )
 
-        if input_add_dims is not None:
+        if len(input_add_dims) > 0:
             # Input add conditioning, module dict
             # self.to_input_add_embed = nn.ModuleDict()
             # for id, dim in input_add_dims.items():
@@ -94,7 +94,7 @@ class DiffusionTransformer(nn.Module):
             # input_add_dims is now an ordered list of tuples (id, dim)
             self.input_add_dims = input_add_dims
             total_input_add_dim = sum([dim for id, dim in input_add_dims])
-            self.to_input_add_embed = nn.Linear(total_input_add_dim, io_channels, bias=False)
+            self.to_input_add_embed = nn.Linear(total_input_add_dim, embed_dim, bias=False)
 
         self.input_concat_dim = input_concat_dim
 
@@ -171,7 +171,7 @@ class DiffusionTransformer(nn.Module):
 
             prepend_length = prepend_cond.shape[1]
 
-        add_emb = self.to_input_add_embed(input_add_cond) if input_add_cond is not None else None
+        add_emb = self.to_input_add_embed(input_add_cond.transpose(1, 2)) if input_add_cond is not None else None
         if input_concat_cond is not None:
             # Interpolate input_concat_cond to the same length as x
             if input_concat_cond.shape[2] != x.shape[2]:
