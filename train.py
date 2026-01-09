@@ -10,6 +10,9 @@ from stable_audio_tools.models import create_model_from_config
 from stable_audio_tools.models.utils import copy_state_dict, load_ckpt_state_dict, remove_weight_norm_from_model
 from stable_audio_tools.training import create_training_wrapper_from_config, create_demo_callback_from_config
 
+from stable_audio_tools.loraw.network import create_lora_from_config
+from stable_audio_tools.loraw.callbacks import LoRAModelCheckpoint
+
 class ExceptionCallback(pl.Callback):
     def on_exception(self, trainer, module, err):
         print(f'{type(err).__name__}: {err}')
@@ -80,7 +83,20 @@ def main():
     if args.remove_pretransform_weight_norm == "post_load":
         remove_weight_norm_from_model(model.pretransform)
 
+    # LORA: Create and activate
+    if args.use_lora == 'true':
+        lora = create_lora_from_config(model_config, model)
+        if args.lora_ckpt_path:
+            lora.load_weights(
+                torch.load(args.lora_ckpt_path, map_location="cpu")["state_dict"]
+            )
+        lora.activate()
+
     training_wrapper = create_training_wrapper_from_config(model_config, model)
+
+    # LORA: Prepare training
+    if args.use_lora == 'true':
+        lora.prepare_for_training(training_wrapper)
 
     exc_callback = ExceptionCallback()
 
@@ -101,8 +117,12 @@ def main():
     else:
         logger = None
         checkpoint_dir = args.save_dir if args.save_dir else None
-        
-    ckpt_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1)
+    
+    # LORA: Custom checkpoint callback
+    if args.use_lora == 'true':
+         ckpt_callback = LoRAModelCheckpoint(lora=lora, every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1)
+    else:
+        ckpt_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1)
     save_model_config_callback = ModelConfigEmbedderCallback(model_config)
 
     if args.val_dataset_config:

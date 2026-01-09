@@ -442,7 +442,8 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         loss_info.update({
             "output": output,
             "targets": targets,
-            "padding_mask": padding_masks if use_padding_mask else None,
+            # "padding_mask": padding_masks if use_padding_mask else None,
+            "padding_mask": inpaint_mask if self.inpainting_config is not None else (padding_masks if use_padding_mask else None)
         })
 
         loss, losses = self.losses(loss_info)
