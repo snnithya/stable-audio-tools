@@ -12,6 +12,7 @@ from stable_audio_tools.data.dataset import create_dataloader_from_config
 from stable_audio_tools.models.factory import create_model_from_config
 from stable_audio_tools.models.pretrained import get_pretrained_model
 from stable_audio_tools.models.utils import load_ckpt_state_dict, copy_state_dict
+from stable_audio_tools.models.diffusion import ConditionedDiffusionModelWrapper
 
 
 def load_model(model_config=None, model_ckpt_path=None, pretrained_name=None, model_half=False):
@@ -136,6 +137,11 @@ def main(args):
         model_ckpt_path=args.ckpt_path,
         model_half=args.model_half
     )
+
+    if type(model) == ConditionedDiffusionModelWrapper:
+        # model is diffusion model, just get its autoencoder
+        model = model.pretransform
+
 
     data_loader = create_dataloader_from_config(
         dataset_config,
