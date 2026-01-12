@@ -251,7 +251,7 @@ def sample_flow_pingpong(model, x, steps=None, sigma_max=1, sigmas=None, callbac
 
 
 @torch.no_grad()
-def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, cfg_pp=False, **extra_args):
+def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, cfg_pp=False, inpaint_masked_input=None, inpaint_mask=None, **extra_args):
     """Draws samples from a model given starting noise. v-diffusion"""
     ts = x.new_ones([x.shape[0]])
 
@@ -265,6 +265,10 @@ def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, 
 
     # The sampling loop
     for i in trange(steps):
+        if inpaint_mask is not None and inpaint_masked_input is not None:
+            # add noise to the masked input according to the current sigma
+            noised_masked_input = inpaint_masked_input * alphas[i] + torch.randn_like(x) * sigmas[i]
+            x = x * (1 - inpaint_mask) + noised_masked_input * inpaint_mask
 
         if cfg_pp:
             # Get the model output (v, the predicted velocity)
@@ -304,6 +308,8 @@ def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, 
             callback({'x': x, 't': t[i], 'sigma': sigmas[i], 'i': i, 'denoised': denoised })
 
     # If we are on the last timestep, output the denoised data
+    if inpaint_mask is not None and inpaint_masked_input is not None:
+        pred = pred * (1 - inpaint_mask) + inpaint_masked_input * inpaint_mask
     return pred
 
 # Soft mask inpainting is just shrinking hard (binary) mask inpainting

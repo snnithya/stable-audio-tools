@@ -83,7 +83,8 @@ class LoRANetwork(nn.Module):
         alpha=16,
         dropout=None,
         module_dropout=None,
-        decompose=False
+        decompose=False,
+        full_ft_list=None
     ):
         super().__init__()
         self.active = False
@@ -93,21 +94,28 @@ class LoRANetwork(nn.Module):
         self.dropout = dropout
         self.module_dropout = module_dropout
         self.lora_modules = nn.ModuleDict()
+        self.full_ft_modules = nn.ModuleDict()
+        full_ft_set = set(full_ft_list) if full_ft_list is not None else set()
         # Scan model and create loras for respective modules
         for name, info in target_map.items():
             module = info["module"]
-            self.lora_modules[name] = TargetableModules[
-                module.__class__.__name__
-            ].value(
-                name,
-                module,
-                multiplier=multiplier,
-                lora_dim=lora_dim,
-                alpha=alpha,
-                dropout=dropout,
-                module_dropout=module_dropout,
-                decompose=decompose
-            )
+            if any(x in name for x in full_ft_set):
+                self.full_ft_modules[name] = module
+                print(f"Full-finetune module added: {name}")
+            else:
+                print(f"LoRA module added: {name}")
+                self.lora_modules[name] = TargetableModules[
+                    module.__class__.__name__
+                ].value(
+                    name,
+                    module,
+                    multiplier=multiplier,
+                    lora_dim=lora_dim,
+                    alpha=alpha,
+                    dropout=dropout,
+                    module_dropout=module_dropout,
+                    decompose=decompose
+                )
 
     def activate(self, target_map):
         for name, module in self.lora_modules.items():
@@ -150,6 +158,7 @@ class LoRAWrapper:
         module_dropout=None,
         decompose=False,
         lr=None,
+        full_ft_list=None,
     ):
         self.target_model = target_model
         self.model_type = model_type
@@ -173,7 +182,8 @@ class LoRAWrapper:
             alpha=alpha,
             dropout=dropout,
             module_dropout=module_dropout,
-            decompose=decompose
+            decompose=decompose,
+            full_ft_list=full_ft_list
         )
 
         # Get a list of bottom-level lora modules, excluding the originals
@@ -183,6 +193,8 @@ class LoRAWrapper:
             self.residual_modules[f"{name}/lora_up"] = module.lora_up
             if module.dora_mag is not None:
                 self.residual_modules[f"{name}/dora_mag"] = module.dora_mag
+        # Store full-ft modules for training
+        self.full_ft_modules = self.net.full_ft_modules
 
     def activate(self):
         assert not self.is_active, "LoRA is already active"
@@ -209,11 +221,21 @@ class LoRAWrapper:
         for param in self.residual_modules.parameters():
             param.requires_grad = True
 
+        # Unfreeze full-ft modules
+        for module in self.full_ft_modules.values():
+            for param in module.parameters():
+                param.requires_grad = True
+
         # Move lora to training device
         self.net.to(device=training_wrapper.device)
 
-        # Replace optimizer to use lora parameters TODO: implement more robust lr stuff
-        training_wrapper.configure_optimizers = self.configure_optimizers
+        # Replace optimizer to use lora and full-ft parameters
+        def combined_optimizers():
+            params = list(self.residual_modules.parameters())
+            for module in self.full_ft_modules.values():
+                params.extend(module.parameters())
+            return optim.Adam(params, lr=self.lr)
+        training_wrapper.configure_optimizers = combined_optimizers
 
         # Trim ema model if present TODO: generalize beyond diffusion models
         if hasattr(training_wrapper, 'diffusion_ema') and training_wrapper.diffusion_ema is not None:
@@ -338,6 +360,8 @@ def create_lora_from_config(config, model):
 
     weight_decompose = lora_config.get("weight_decompose", False)
 
+    full_ft_list = lora_config.get("full_ft_list", None)
+    print(f'Full-finetune list: {full_ft_list}')
     lora = LoRAWrapper(
         model,
         model_type=model_type,
@@ -348,7 +372,7 @@ def create_lora_from_config(config, model):
         dropout=dropout,
         module_dropout=module_dropout,
         lr=lr,
-        decompose=weight_decompose
+        decompose=weight_decompose,
+        full_ft_list=full_ft_list
     )
-
     return lora

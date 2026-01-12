@@ -267,11 +267,17 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         self.diffusion_objective = model.diffusion_objective
 
+        # Inpainting
+        self.inpainting_config = inpainting_config
+        
+        if self.inpainting_config is not None:
+            self.inpaint_mask_kwargs = self.inpainting_config.get("mask_kwargs", {})
+
         self.loss_modules = [
             MSELoss("output",
                    "targets",
                    weight=1.0,
-                   mask_key="padding_mask" if self.mask_padding else None,
+                   mask_key="padding_mask" if self.inpainting_config is not None else None,
                    name="mse_loss"
             )
         ]
@@ -301,11 +307,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         self.pre_encoded = pre_encoded
 
-        # Inpainting
-        self.inpainting_config = inpainting_config
-        
-        if self.inpainting_config is not None:
-            self.inpaint_mask_kwargs = self.inpainting_config.get("mask_kwargs", {})
+
 
         # Validation
         self.validation_timesteps = validation_timesteps
@@ -442,8 +444,8 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         loss_info.update({
             "output": output,
             "targets": targets,
-            # "padding_mask": padding_masks if use_padding_mask else None,
-            "padding_mask": inpaint_mask if self.inpainting_config is not None else (padding_masks if use_padding_mask else None)
+            # "padding_mask": padding_masks if use_padding_mask else None
+            "padding_mask": (1 - inpaint_mask).bool() if self.inpainting_config is not None else (padding_masks if use_padding_mask else None)
         })
 
         loss, losses = self.losses(loss_info)
@@ -712,7 +714,7 @@ class DiffusionCondDemoCallback(pl.Callback):
                     model = module.diffusion_ema.ema_model if module.diffusion_ema is not None else module.diffusion.model
 
                     if module.diffusion_objective == "v":
-                        fakes = sample(model, noise, self.demo_steps, 0, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True)
+                        fakes = sample(model, noise, self.demo_steps, 0, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True, inpaint_masked_input=inpaint_masked_input if module.inpainting_config is not None else None, inpaint_mask=inpaint_mask if module.inpainting_config is not None else None)
                     elif module.diffusion_objective == "rectified_flow":
                         fakes = sample_discrete_euler(model, noise, self.demo_steps, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True)
                     elif module.diffusion_objective == "rf_denoiser":

@@ -72,6 +72,7 @@
         "diffusion": {
             "cross_attention_cond_ids": ["prompt", "seconds_start", "seconds_total"],
             "global_cond_ids": ["seconds_start", "seconds_total"],
+            "input_add_ids": [["inpaint_mask", 1], ["inpaint_masked_input", 64]],
             "type": "dit",
             "config": {
                 "io_channels": 64,
@@ -80,6 +81,7 @@
                 "num_heads": 24,
                 "cond_token_dim": 768,
                 "global_cond_dim": 1536,
+                "input_add_dims": [["inpaint_mask", 1], ["inpaint_masked_input", 64]],
                 "project_cond_tokens": false,
                 "transformer_type": "continuous_transformer"
             }
@@ -90,6 +92,13 @@
         "use_ema": false,
         "log_loss_info": false,
         "pre_encoded": true,
+        "inpainting": {
+            "mask_kwargs": {
+                "max_mask_segments": 1,
+                "mask_type_probabilities": [0, 0, 1.0],
+                "fixed_mask_size": 208
+            }
+        },
         "optimizer_configs": {
             "diffusion": {
                 "optimizer": {
@@ -114,7 +123,7 @@
             "demo_every": 2000,
             "demo_steps": 50,
             "num_demos": 4,
-            "demo_cond_from_batch": false,
+            "demo_cond_from_batch": true,
             "demo_cond": [
                 {"prompt": "The chill track's mood is set by the gentle strumming of a clean sounding electric guitar, which has a slight delay effect added to it.", "seconds_total": 12, "seconds_start": 0},
                 {"prompt": "The music piece is an instrumental with a prominent guitar sound, belonging to the genres blues and classicrock, and has a mood that is cool. It follows a 4/4 time signature and features a tempo of 120.0 bpm.", "seconds_total": 12, "seconds_start": 0},
@@ -125,7 +134,8 @@
         }
     },
     "lora": {
-        "component_whitelist": ["transformer"],
+        "component_whitelist": ["transformer", "to_timestep_embed", "to_cond_embed", "to_global_cond_embed", "to_input_add_embed"],
+        "full_ft_list": ["to_input_add_embed"],
         "multiplier": 1.0,
         "rank": 32,
         "alpha": 32,
