@@ -11,7 +11,7 @@
             "id": "ossl2",
             "path": "/home/share/datasets/sketch2music/",
             "custom_metadata_module": "/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/dataset_configs/custom_metadata/custom_md_ossl.py",
-            "whitelist_pth": "/home/zachary/code/sat-sony/vg_whitelist.txt",
+            "whitelist_pth": "/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/dataset_configs/vgm_whitelist_new.txt",
             "latent_extension": "pt"
         }
     ],

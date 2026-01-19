@@ -95,7 +95,7 @@ def truncated_logistic_normal_rescaled(shape, left_trunc=0.075, right_trunc=1):
     return rescaled_samples
 
 @torch.no_grad()
-def sample_discrete_euler(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, dist_shift=None, disable_tqdm=False, **extra_args):
+def sample_discrete_euler(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, dist_shift=None, disable_tqdm=False, inpaint_masked_input=None, inpaint_mask=None, **extra_args):
     """Draws samples from a model given starting noise. Euler method"""
 
     assert steps is not None or sigmas is not None, "Either steps or sigmas must be provided"
@@ -118,6 +118,10 @@ def sample_discrete_euler(model, x, steps=None, sigma_max=1, sigmas=None, callba
 
     for i, (t_curr, t_prev) in enumerate(tqdm(zip(t[:-1], t[1:]), disable=disable_tqdm)):
         # Broadcast the current timestep to the correct shape
+        if inpaint_mask is not None and inpaint_masked_input is not None:
+            # add noise to the masked input according to the current sigma
+            noised_masked_input = inpaint_masked_input * (1 - t_curr) + torch.randn_like(x) * t_curr
+            x = x * (1 - inpaint_mask) + noised_masked_input * inpaint_mask
         t_curr_tensor = t_curr * torch.ones(
             (x.shape[0],), dtype=x.dtype, device=x.device
         )
@@ -132,6 +136,9 @@ def sample_discrete_euler(model, x, steps=None, sigma_max=1, sigmas=None, callba
             callback({'x': x, 't': t_curr, 'sigma': t_curr, 'i': i+1, 'denoised': denoised })
 
     # If we are on the last timestep, output the denoised data
+    if inpaint_mask is not None and inpaint_masked_input is not None:
+        x = x * (1 - inpaint_mask) + inpaint_masked_input * inpaint_mask
+
     return x
 
 @torch.no_grad()

@@ -716,7 +716,7 @@ class DiffusionCondDemoCallback(pl.Callback):
                     if module.diffusion_objective == "v":
                         fakes = sample(model, noise, self.demo_steps, 0, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True, inpaint_masked_input=inpaint_masked_input if module.inpainting_config is not None else None, inpaint_mask=inpaint_mask if module.inpainting_config is not None else None)
                     elif module.diffusion_objective == "rectified_flow":
-                        fakes = sample_discrete_euler(model, noise, self.demo_steps, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True)
+                        fakes = sample_discrete_euler(model, noise, self.demo_steps, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True, inpaint_masked_input=inpaint_masked_input if module.inpainting_config is not None else None, inpaint_mask=inpaint_mask if module.inpainting_config is not None else None)
                     elif module.diffusion_objective == "rf_denoiser":
                         logsnr = torch.linspace(-6, 2, self.demo_steps+1).to(module.device)
                         sigmas = torch.sigmoid(-logsnr)

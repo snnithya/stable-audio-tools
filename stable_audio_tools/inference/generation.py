@@ -404,6 +404,166 @@ def generate_diffusion_cond_inpaint(
     # Return audio
     return sampled
 
+def generate_diffusion_cond_blockar(
+        model,
+        steps: int = 250,
+        cfg_scale=6,
+        conditioning: dict = None,
+        conditioning_tensors: tp.Optional[dict] = None,
+        negative_conditioning: dict = None,
+        negative_conditioning_tensors: tp.Optional[dict] = None,
+        batch_size: int = 1,
+        sample_size: int = 2097152,
+        sample_rate: int = 48000,
+        seed: int = -1,
+        device: str = "cuda",
+        init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
+        return_latents = False,
+        ar_style: str = 'outpaint',
+        block_size: int = 98304,
+        generation_length: int = 2097152,
+        **sampler_kwargs
+    ) -> torch.Tensor: 
+    '''
+    The idea here is to do block-wise autoregressive generation, where we generate a block of audio at a time
+    TODO: This currently will only support the 'outpaint' style, where we generate by:
+    1) Initialize the mask to condition on the latent sample_size - block_size samples, with the masked_input set to the initial audio (if it exists) or zeros. if init_audio is provided, we'll condition on the last sample_size - block_size samples of it
+    2) Generate the first block of size block_size (i.e. the rightmost block_size latent samples)
+    3) Update the masked input to include the newly generated audio by sliding it over to the left by block_size samples
+    4) Repeat steps 2-3 until we've generated generation_length samples
+    The interior sampling loop should be similar to generate_diffusion_cond
+    '''
+    assert ar_style == 'outpaint', "Only 'outpaint' ar_style is currently supported"
+
+    generated_audio = []
+    total_generated = 0
+
+    audio_sample_size = sample_size
+
+    if model.pretransform is not None:
+        sample_size = sample_size // model.pretransform.downsampling_ratio
+        block_size = block_size // model.pretransform.downsampling_ratio
+        generation_length = generation_length // model.pretransform.downsampling_ratio
+    
+    # Seed
+    # The user can explicitly set the seed to deterministically generate the same output. Otherwise, use a random seed.
+    seed = seed if seed != -1 else np.random.randint(0, 2**32 - 1)
+    print(seed)
+    torch.manual_seed(seed)
+    # Define the initial noise immediately after setting the seed
+    noise = torch.randn([batch_size, model.io_channels, sample_size], device=device)
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cudnn.benchmark = False
+
+    # Conditioning
+    assert conditioning is not None or conditioning_tensors is not None, "Must provide either conditioning or conditioning_tensors"
+    if conditioning_tensors is None:
+        conditioning_tensors = model.conditioner(conditioning, device)
+    if negative_conditioning is not None or negative_conditioning_tensors is not None:
+        if negative_conditioning_tensors is None:
+            negative_conditioning_tensors = model.conditioner(negative_conditioning, device)
+    else:
+        negative_conditioning_tensors = {}
+
+
+    if init_audio is not None:
+        # The user supplied some initial audio (for inpainting or variation). Let us prepare the input audio.
+        in_sr, init_audio = init_audio
+
+        io_channels = model.io_channels
+
+        # For latent models, set the io_channels to the autoencoder's io_channels
+        if model.pretransform is not None:
+            io_channels = model.pretransform.io_channels
+
+        # Prepare the initial audio for use by the model
+        init_audio = prepare_audio(init_audio, in_sr=in_sr, target_sr=model.sample_rate, target_length=audio_sample_size, target_channels=io_channels, device=device)
+
+        # For latent models, encode the initial audio into latents
+        if model.pretransform is not None:
+            init_audio = model.pretransform.encode(init_audio)
+            
+        init_audio = init_audio.repeat(batch_size, 1, 1)
+
+    mask = torch.zeros((batch_size, 1, sample_size), device=device)
+    mask[:, :, :sample_size - block_size] = 1.0  # condition on the leftmost sample_size - block_size samples
+
+    if init_audio is not None:
+        # truncate init_audio to the last sample_size - block_size samples
+        init_audio = init_audio[:, :, - (sample_size - block_size):]
+        # pad init_audio to sample_size with zeros on the right
+        init_audio = torch.cat([init_audio, torch.zeros((batch_size, model.io_channels, block_size), device=device)], dim=2)
+        inpaint_input = init_audio
+    else:
+        inpaint_input = torch.zeros((batch_size, model.io_channels, sample_size), device=device)
+
+    conditioning_tensors['inpaint_mask'] = [mask]
+    conditioning_tensors['inpaint_masked_input'] = [inpaint_input]
+    conditioning_inputs = model.get_conditioning_inputs(conditioning_tensors)
+
+    if negative_conditioning_tensors:
+        negative_conditioning_tensors['inpaint_mask'] = [mask]
+        negative_conditioning_tensors['inpaint_masked_input'] = [inpaint_input]
+        negative_conditioning_tensors = model.get_conditioning_inputs(negative_conditioning_tensors, negative=True)
+
+    model_dtype = next(model.model.parameters()).dtype
+    while total_generated < generation_length:
+        noise = noise.type(model_dtype)
+        conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in conditioning_inputs.items()}
+
+        # k-diffusion denoising process go!
+        diff_objective = model.diffusion_objective
+
+        if diff_objective == "v":    
+            # k-diffusion denoising process go!
+            sampled = sample_k(model.model, noise, steps=steps, **sampler_kwargs, **conditioning_inputs, **negative_conditioning_tensors, cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, device=device, inpaint_masked_input=inpaint_input, inpaint_mask=mask)
+        elif diff_objective in ["rectified_flow", "rf_denoiser"]:
+
+            if "sigma_min" in sampler_kwargs:
+                del sampler_kwargs["sigma_min"]
+
+            if "rho" in sampler_kwargs:
+                del sampler_kwargs["rho"]
+
+            sampled = sample_rf(model.model, noise, steps=steps, **sampler_kwargs, **conditioning_inputs, **negative_conditioning_tensors, cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, device=device, inpaint_masked_input=inpaint_input, inpaint_mask=mask)
+       
+       # Get the last block_size samples from sampled
+        generated_block = sampled[:, :, -block_size:]
+        generated_audio.append(generated_block.detach())
+        total_generated += block_size
+        if total_generated >= generation_length:
+            del sampled
+            del conditioning_tensors
+            del conditioning_inputs
+            torch.cuda.empty_cache()
+            break
+        # update inpaint_input
+        inpaint_input = inpaint_input.detach()
+        inpaint_input[..., -block_size:] = generated_block
+        # slide inpaint_input to the left by block_size samples
+        inpaint_input = torch.cat([inpaint_input[:, :, block_size:], torch.zeros_like(inpaint_input[:, :, :block_size])], dim=2)
+        # mask stays the same
+        conditioning_tensors['inpaint_masked_input'] = [inpaint_input]
+        conditioning_inputs = model.get_conditioning_inputs(conditioning_tensors)
+        if negative_conditioning_tensors:
+            negative_conditioning_tensors['inpaint_masked_input'] = [inpaint_input]
+            negative_conditioning_tensors = model.get_conditioning_inputs(negative_conditioning_tensors, negative=True)
+        noise = torch.randn([batch_size, model.io_channels, sample_size], device=device)
+        del sampled
+
+    generated_audio = torch.cat(generated_audio, dim=2)
+    if model.pretransform is not None and not return_latents:
+        #cast sampled latents to pretransform dtype
+        generated_audio = generated_audio.to(next(model.pretransform.parameters()).dtype)
+        generated_audio = model.pretransform.decode(generated_audio)
+
+    # Return audio
+    return generated_audio
+        
+
 
 # builds a softmask given the parameters
 # returns array of values 0 to 1, size sample_size, where 0 means noise / fresh generation, 1 means keep the input audio, 

@@ -243,14 +243,22 @@ class LoRAWrapper:
 
         self.is_trainable = True
 
-    # Saves residual weights
+    # Saves both LoRA and full-ft weights
     def save_weights(self, path, dtype=torch.float16):
-        torch.save(self.residual_modules.state_dict(), path)
+        save_dict = {
+            'lora': self.residual_modules.state_dict(),
+            'full_ft': {name: module.state_dict() for name, module in self.full_ft_modules.items()}
+        }
+        print(f'Saving LoRA and full-ft weights to {path}')
+        # print keys being saved
+        print(f'Saving LoRA keys: {list(save_dict["lora"].keys())}')
+        print(f'Saving full-ft keys: {list(save_dict["full_ft"].keys())}')
+        torch.save(save_dict, path)
 
-    # Loads any saved residual weights, changing structure as needed
-    # Note: if loading correctly shaped weights, you can directly use LoRAWrapper.residual_modules.load_state_dict()
-    def load_weights(self, residual_weights, multiplier=1.0):
-        # Group entries by lora module
+    # Loads both LoRA and full-ft weights
+    def load_weights(self, weights_dict, multiplier=1.0):
+        # LoRA weights
+        residual_weights = weights_dict.get('lora', {})
         grouped = {}
         for key, weight in residual_weights.items():
             ancestors = key.split('/')
@@ -260,7 +268,7 @@ class LoRAWrapper:
             weights[module_name] = weight
             grouped[lora_name] = weights
 
-        # Update weights
+        # Update LoRA weights
         for lora_name, weights in grouped.items():
             module = self.net.lora_modules[lora_name]
             is_dora = 'dora_mag' in weights
@@ -282,6 +290,12 @@ class LoRAWrapper:
                 module.dora_mag.weight.data = (weights['lora_down'] * multiplier).detach()
             else:
                 module.dora_mag = None
+
+        # Full-ft weights
+        full_ft_weights = weights_dict.get('full_ft', {})
+        for name, state in full_ft_weights.items():
+            if name in self.full_ft_modules:
+                self.full_ft_modules[name].load_state_dict(state)
 
     # Simple merge implementation for same-shaped loras
     def merge_weights(self, residual_weights, multiplier=1.0):
@@ -307,30 +321,47 @@ class LoRAMerger(LoRAWrapper):
         **kwargs
     ):
         super().__init__(target_model, **kwargs)
-        self.backup = {name: module.original_module.weight.data.clone().detach().to('cpu') for name, module in self.net.lora_modules.items()}
+        # Backup LoRA weights
+        self.backup_lora = {name: module.original_module.weight.data.clone().detach().to('cpu') for name, module in self.net.lora_modules.items()}
+        # Backup full-ft weights
+        self.backup_full_ft = {name: module.state_dict() for name, module in self.net.full_ft_modules.items()}
         self.lora_paths = {}
 
     def register(self, name, path):
         self.lora_paths[name] = path
         print(f'LoRA registered: {name}')
 
-    def merge(self, lora_multipliers=None):
+    def merge(self, lora_multipliers=None, full_ft_paths=None):
         # If no multipliers specified, set all to 1.0
         if lora_multipliers is None:
             lora_multipliers = {name: 1.0 for name in self.lora_paths.keys()}
 
+        # Merge LoRA weights
         for lora_name, mul in lora_multipliers.items():
             if mul > 0:
-                self.load_weights(torch.load(self.lora_paths[lora_name]), multiplier=mul)
+                weights_dict = torch.load(self.lora_paths[lora_name])
+                self.load_weights(weights_dict, multiplier=mul)
                 self.net.update_base()
                 print(f'{lora_name} merged with strength {mul}')
 
+        # Merge full-ft weights if provided
+        if full_ft_paths is not None:
+            for name, path in full_ft_paths.items():
+                if name in self.net.full_ft_modules:
+                    state = torch.load(path)
+                    self.net.full_ft_modules[name].load_state_dict(state)
+                    print(f'Full-ft module {name} loaded from {path}')
+
     def restore(self):
+        # Restore LoRA weights
         for name, module in self.net.lora_modules.items():
-            module.original_module.weight.data = self.backup[name].clone().detach().to('cuda')
+            module.original_module.weight.data = self.backup_lora[name].clone().detach().to('cuda')
+        # Restore full-ft weights
+        for name, module in self.net.full_ft_modules.items():
+            module.load_state_dict(self.backup_full_ft[name])
         gc.collect()
         torch.cuda.empty_cache()
-        print('Base model weights restored from backup')
+        print('Base model weights (LoRA and full-ft) restored from backup')
     
 
 def create_lora_from_config(config, model):
