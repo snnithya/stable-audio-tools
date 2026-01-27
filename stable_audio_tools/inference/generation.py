@@ -489,11 +489,14 @@ def generate_diffusion_cond_blockar(
         init_audio = init_audio.repeat(batch_size, 1, 1)
 
     mask = torch.zeros((batch_size, 1, sample_size), device=device)
+    print(f"Block size: {block_size}, Sample size: {sample_size}")
     mask[:, :, :sample_size - block_size] = 1.0  # condition on the leftmost sample_size - block_size samples
 
     if init_audio is not None:
-        # truncate init_audio to the last sample_size - block_size samples
-        init_audio = init_audio[:, :, - (sample_size - block_size):]
+        # truncate init_audio to the first sample_size - block_size samples
+        init_audio = init_audio[:, :, : (sample_size - block_size)]
+        # add initial to generated_audio
+        generated_audio.append(init_audio.detach())
         # pad init_audio to sample_size with zeros on the right
         init_audio = torch.cat([init_audio, torch.zeros((batch_size, model.io_channels, block_size), device=device)], dim=2)
         inpaint_input = init_audio

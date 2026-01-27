@@ -149,6 +149,7 @@ class DiffusionTransformer(nn.Module):
         prepend_cond_mask=None,
         return_info=False,
         exit_layer_ix=None,
+        enc_enc_mask=None,
         **kwargs):
 
         if cross_attn_cond is not None:
@@ -207,6 +208,9 @@ class DiffusionTransformer(nn.Module):
 
         x = self.preprocess_conv(x) + x
 
+        if enc_enc_mask is not None:
+            x = x * enc_enc_mask
+
         x = rearrange(x, "b c t -> b t c")
 
         extra_args = {}
@@ -219,7 +223,7 @@ class DiffusionTransformer(nn.Module):
 
         if self.transformer_type == "continuous_transformer":
             # Masks not currently implemented for continuous transformer
-            output = self.transformer(x, prepend_embeds=prepend_inputs, context=cross_attn_cond, return_info=return_info, exit_layer_ix=exit_layer_ix, input_add_emb=add_emb, **extra_args, **kwargs)
+            output = self.transformer(x, prepend_embeds=prepend_inputs, context=cross_attn_cond, return_info=return_info, exit_layer_ix=exit_layer_ix, input_add_emb=add_emb, enc_enc_mask=enc_enc_mask, **extra_args, **kwargs)
 
             if return_info:
                 output, info = output
@@ -273,6 +277,7 @@ class DiffusionTransformer(nn.Module):
         mask=None,
         return_info=False,
         exit_layer_ix=None,
+        enc_enc_mask=None,
         **kwargs):
 
 
@@ -328,6 +333,7 @@ class DiffusionTransformer(nn.Module):
                 mask=mask,
                 return_info=return_info,
                 exit_layer_ix=exit_layer_ix,
+                enc_enc_mask=enc_enc_mask,
                 **kwargs
             )
 
@@ -429,6 +435,11 @@ class DiffusionTransformer(nn.Module):
                 batch_masks = torch.cat([mask, mask], dim=0)
             else:
                 batch_masks = None
+
+            if enc_enc_mask is not None:
+                batch_enc_enc_mask = torch.cat([enc_enc_mask, enc_enc_mask], dim=0)
+            else:
+                batch_enc_enc_mask = None
             
             batch_output = self._forward(
                 batch_inputs, 
@@ -442,6 +453,7 @@ class DiffusionTransformer(nn.Module):
                 prepend_cond = batch_prepend_cond,
                 prepend_cond_mask = batch_prepend_cond_mask,
                 return_info = return_info,
+                enc_enc_mask = batch_enc_enc_mask,
                 **kwargs)
 
             if return_info:
@@ -479,5 +491,6 @@ class DiffusionTransformer(nn.Module):
                 prepend_cond_mask=prepend_cond_mask,
                 mask=mask,
                 return_info=return_info,
+                enc_enc_mask=enc_enc_mask,
                 **kwargs
             )

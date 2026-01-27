@@ -1,7 +1,7 @@
 import random
 import torch
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 class MaskType(Enum):
     RANDOM_SEGMENTS = 0
@@ -14,6 +14,9 @@ def random_inpaint_mask(
     max_mask_segments: int = 10,
     mask_type_probabilities: Optional[List[float]] = None,
     fixed_mask_size: Optional[int] = None,
+    outpainting_dropout_probs: Optional[Dict[str, float]] = None,
+    silence_mean: Optional[torch.Tensor] = None,
+    silence_scale: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generates random inpainting masks for a batch of latent audio sequences.
@@ -53,6 +56,8 @@ def random_inpaint_mask(
             )
 
     output_masks_list = []
+    if outpainting_dropout_probs is not None:
+        dropout_mask_list = []
     mask_types_to_sample = [mt.value for mt in MaskType]
 
     for i in range(b):
@@ -93,9 +98,40 @@ def random_inpaint_mask(
                 
                 if unmasked_prefix_len < real_sequence_length:
                     item_mask[:, :, unmasked_prefix_len:real_sequence_length] = 0
+                
+                if outpainting_dropout_probs is not None:
+                    p_uncond = outpainting_dropout_probs.get('p_uncond', 0.0)
+                    p_partial = outpainting_dropout_probs.get('p_partial', 0.0)
+                    rand_val = random.random()
+                    dropout_mask = item_mask.clone()
+                    if rand_val < p_uncond:
+                        # Drop entire unmasked prefix
+                        dropout_mask[:, :, :real_sequence_length] = 0
+                    elif rand_val < p_uncond + p_partial and unmasked_prefix_len > 0:
+                        # Drop some start of the unmasked prefix
+                        chunk_size = real_sequence_length - unmasked_prefix_len
+                        if chunk_size > 0:
+                            num_chunks = unmasked_prefix_len // chunk_size
+                            # sample how many chunks to drop, always drop from the start
+                            chunks_to_drop = random.randint(1, num_chunks)
+                            drop_length = chunks_to_drop * chunk_size
+                            dropout_mask[:, :, :drop_length] = 0
+                        
         
         output_masks_list.append(item_mask)
+        if outpainting_dropout_probs is not None:
+            dropout_mask_list.append(dropout_mask)
 
     final_inpaint_mask = torch.cat(output_masks_list, dim=0).to(sequence.device)
+    if outpainting_dropout_probs is not None:
+        final_dropout_mask = torch.cat(dropout_mask_list, dim=0).to(sequence.device)
+        
+        if silence_mean is None or silence_scale is None:
+            raise ValueError("silence_mean and silence_scale must be provided when using outpainting dropout.")
+
+        silence_mean_expanded = silence_mean.repeat(b, 1, 1).to(sequence.device)
+        silence_scale_expanded = silence_scale.repeat(b, 1, 1).to(sequence.device)
+        silence_latents = silence_mean_expanded + torch.randn_like(sequence) * silence_scale_expanded
+        sequence = sequence * final_dropout_mask + silence_latents * (1 - final_dropout_mask)
     masked_sequence = sequence * final_inpaint_mask
     return masked_sequence, final_inpaint_mask

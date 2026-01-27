@@ -803,6 +803,7 @@ class ContinuousTransformer(nn.Module):
         use_checkpointing = True,
         exit_layer_ix = None,
         input_add_emb = None,
+        enc_enc_mask = None,
         **kwargs
     ):
         batch, seq, device = *x.shape[:2], x.device
@@ -817,6 +818,11 @@ class ContinuousTransformer(nn.Module):
         }
 
         x = self.project_in(x)
+
+        if enc_enc_mask is not None:
+            # reshape enc_enc_mask to batch seq channels
+            enc_enc_mask = enc_enc_mask.transpose(-1, -2)
+            x = x * enc_enc_mask
 
         if input_add_emb is not None:
             x = x + input_add_emb

@@ -226,6 +226,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             optimizer_configs: dict = None,
             pre_encoded: bool = False,
             cfg_dropout_prob = 0.1,
+            enc_enc: bool = False,
             timestep_sampler: tp.Literal["uniform", "logit_normal", "trunc_logit_normal", "log_snr"] = "uniform",
             timestep_sampler_options: tp.Optional[tp.Dict[str, tp.Any]] = None,
             validation_timesteps = [0.1, 0.3, 0.5, 0.7, 0.9],
@@ -253,6 +254,8 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         self.cfg_dropout_prob = cfg_dropout_prob
 
+        self.enc_enc = enc_enc
+
         self.rng = torch.quasirandom.SobolEngine(1, scramble=True)
 
         self.timestep_sampler = timestep_sampler     
@@ -272,6 +275,16 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         
         if self.inpainting_config is not None:
             self.inpaint_mask_kwargs = self.inpainting_config.get("mask_kwargs", {})
+            print(f"Inpainting mask kwargs: {self.inpaint_mask_kwargs}")
+            if "outpainting_dropout_probs" in self.inpaint_mask_kwargs:
+                # load in silence tensors
+                self.silence_mean = torch.load("/home/zachary/code/stable-audio-tools/notebooks/mean_silence.pt", map_location="cpu")
+                self.silence_scale = torch.load("/home/zachary/code/stable-audio-tools/notebooks/scale_silence.pt", map_location="cpu")
+                self.silence_mean = self.silence_mean.to(self.device)
+                self.silence_scale = self.silence_scale.to(self.device)
+            else:
+                self.silence_mean = None
+                self.silence_scale = None
 
         self.loss_modules = [
             MSELoss("output",
@@ -433,11 +446,20 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             # Max mask size is the full sequence length
             max_mask_length = diffusion_input.shape[2]
 
+            if self.silence_scale is not None and self.silence_scale.device != diffusion_input.device:
+                self.silence_scale = self.silence_scale.to(diffusion_input.device)
+            if self.silence_mean is not None and self.silence_mean.device != diffusion_input.device:
+                self.silence_mean = self.silence_mean.to(diffusion_input.device)
+
             # Create a mask of random length for a random slice of the input
-            inpaint_masked_input, inpaint_mask = random_inpaint_mask(diffusion_input, padding_masks=padding_masks, **self.inpaint_mask_kwargs)
+            inpaint_masked_input, inpaint_mask = random_inpaint_mask(diffusion_input, padding_masks=padding_masks, **self.inpaint_mask_kwargs, silence_mean=self.silence_mean, silence_scale=self.silence_scale)
 
             conditioning['inpaint_mask'] = [inpaint_mask]
             conditioning['inpaint_masked_input'] = [inpaint_masked_input]
+        
+        if inpaint_mask is not None and self.enc_enc:
+            extra_args["enc_enc_mask"] = (1 - inpaint_mask)
+
         output = self.diffusion(noised_inputs, t, cond=conditioning, cfg_dropout_prob = self.cfg_dropout_prob, **extra_args)
         p.tick("diffusion")
 
@@ -664,7 +686,7 @@ class DiffusionCondDemoCallback(pl.Callback):
                 padding_masks = torch.stack([md["padding_mask"][0] for md in demo_cond], dim=0).to(module.device) # Shape (batch_size, sequence_length)
 
                 # Create a mask of random length for a random slice of the input
-                inpaint_masked_input, inpaint_mask = random_inpaint_mask(batch[0][:self.num_demos], padding_masks=padding_masks, **module.inpaint_mask_kwargs)
+                inpaint_masked_input, inpaint_mask = random_inpaint_mask(batch[0][:self.num_demos], padding_masks=padding_masks, **module.inpaint_mask_kwargs, silence_mean=module.silence_mean, silence_scale=module.silence_scale)
 
                 conditioning['inpaint_mask'] = [inpaint_mask]
                 conditioning['inpaint_masked_input'] = [inpaint_masked_input]
@@ -705,6 +727,9 @@ class DiffusionCondDemoCallback(pl.Callback):
                         torchaudio.save(filename, audio_inputs_out, self.sample_rate)
                         log_audio(trainer.logger, f'demo_{cond_id}', filename, self.sample_rate)
                         log_image(trainer.logger, f"demo_{cond_id}_melspec_left", audio_spectrogram_image(audio_inputs_out))
+            
+            if module.inpainting_config is not None and module.enc_enc:
+                cond_inputs['enc_enc_mask'] = (1 - inpaint_mask)
 
             for cfg_scale in self.demo_cfg_scales:
 
