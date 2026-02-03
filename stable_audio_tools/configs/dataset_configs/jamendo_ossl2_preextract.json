@@ -16,5 +16,5 @@
         }
     ],
     "random_crop": true,
-    "latent_crop_length": 256
+    "latent_crop_length": 255
 }

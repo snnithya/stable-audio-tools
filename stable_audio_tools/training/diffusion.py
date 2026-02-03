@@ -12,6 +12,7 @@ from safetensors.torch import save_file
 from torch import optim
 from torch.nn import functional as F
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from torch.nn.attention.flex_attention import create_block_mask, or_masks
 
 from ..interface.aeiou import pca_point_cloud, audio_spectrogram_image, tokens_spectrogram_image
 from ..inference.sampling import get_alphas_sigmas, sample, sample_discrete_euler, sample_flow_pingpong, truncated_logistic_normal_rescaled, DistributionShift, sample_timesteps_logsnr
@@ -286,6 +287,26 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 self.silence_mean = None
                 self.silence_scale = None
 
+        # if self.enc_enc:
+
+        #     fixed_mask_size = self.inpaint_mask_kwargs.get("fixed_mask_size", None)
+        #     assert fixed_mask_size is not None, "fixed_mask_size must be specified in inpaint_mask_kwargs when using enc_enc"
+        #     mask_type = self.inpaint_mask_kwargs.get("mask_type", "enc-dec")
+        #     match mask_type:
+        #         case "enc-dec":
+        #             def prefix_mask(b, h, q_idx, kv_idx):
+        #                 return kv_idx < fixed_mask_size
+                    
+        #             def postfix_mask(b, h, q_idx, kv_idx):
+        #                 return q_idx >= fixed_mask_size
+        #         case "block-causal"
+            
+        #     self.mask_mod = or_masks(prefix_mask, postfix_mask) 
+        #     # we can't make the actual mask yet, as that needs to happen in training loop when we get the first batch to get the sequence length
+            
+
+
+
         self.loss_modules = [
             MSELoss("output",
                    "targets",
@@ -459,6 +480,39 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         
         if inpaint_mask is not None and self.enc_enc:
             extra_args["enc_enc_mask"] = (1 - inpaint_mask)
+            # get mask
+            if getattr(self, 'self_attention_block_mask', None) is None:
+
+                fixed_mask_size = self.inpaint_mask_kwargs.get("fixed_mask_size", None)
+                seq_len = diffusion_input.shape[2]
+                assert fixed_mask_size is not None, "fixed_mask_size must be specified in inpaint_mask_kwargs when using enc_enc"
+                attn_pattern = self.inpaint_mask_kwargs.get("enc_enc_attention_pattern", "enc-dec")
+                print(f"Creating enc-enc self attention block mask with pattern {attn_pattern} and fixed mask size {fixed_mask_size} for sequence length {seq_len}")
+                match attn_pattern:
+                    case "enc-dec":
+                        def prefix_mask(b, h, q_idx, kv_idx):
+                            return kv_idx < fixed_mask_size
+                        
+                        def postfix_mask(b, h, q_idx, kv_idx):
+                            return q_idx >= fixed_mask_size
+                    case "block-causal":
+                        block_size = seq_len+1 - fixed_mask_size # TODO: all this +1 bullshit is because of preprend conditioning the timestep, so all sequences are actually +1 longer
+                        # make prefix mask block causal
+                        def prefix_mask(b, h, q_idx, kv_idx):
+                            mod_idx = fixed_mask_size % block_size
+                            block_idx = (kv_idx - mod_idx) // block_size
+                            q_block_idx = (q_idx - mod_idx) // block_size
+                            return q_block_idx >= (block_idx)
+                        def postfix_mask(b, h, q_idx, kv_idx):
+                            return q_idx >= fixed_mask_size
+                
+                self.mask_mod = or_masks(prefix_mask, postfix_mask) 
+                # create the mask now
+                
+                self.self_attention_block_mask = create_block_mask(self.mask_mod, B=None, H=None, Q_LEN=seq_len+1, KV_LEN=seq_len+1, device=self.device, _compile=True) # TODO: maybe play around with BLOCK_SIZE later
+                print('Created self attention block mask:')
+                print(self.self_attention_block_mask.to_string())
+            extra_args["self_attention_block_mask"] = self.self_attention_block_mask
 
         output = self.diffusion(noised_inputs, t, cond=conditioning, cfg_dropout_prob = self.cfg_dropout_prob, **extra_args)
         p.tick("diffusion")
@@ -730,6 +784,7 @@ class DiffusionCondDemoCallback(pl.Callback):
             
             if module.inpainting_config is not None and module.enc_enc:
                 cond_inputs['enc_enc_mask'] = (1 - inpaint_mask)
+                cond_inputs['self_attention_block_mask'] = module.self_attention_block_mask
 
             for cfg_scale in self.demo_cfg_scales:
 

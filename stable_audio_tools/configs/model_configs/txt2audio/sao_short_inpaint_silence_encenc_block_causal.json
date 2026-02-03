@@ -98,6 +98,7 @@
                 "max_mask_segments": 1,
                 "mask_type_probabilities": [0, 0, 1.0],
                 "fixed_mask_size": 208,
+                "enc_enc_attention_pattern": "block-causal",
                 "outpainting_dropout_probs":
                     {
                         "p_uncond": 0.1,

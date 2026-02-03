@@ -422,6 +422,7 @@ def generate_diffusion_cond_blockar(
         ar_style: str = 'outpaint',
         block_size: int = 98304,
         generation_length: int = 2097152,
+        silence_dir: str = '/home/zachary/code/stable-audio-tools/notebooks/',
         **sampler_kwargs
     ) -> torch.Tensor: 
     '''
@@ -501,7 +502,15 @@ def generate_diffusion_cond_blockar(
         init_audio = torch.cat([init_audio, torch.zeros((batch_size, model.io_channels, block_size), device=device)], dim=2)
         inpaint_input = init_audio
     else:
-        inpaint_input = torch.zeros((batch_size, model.io_channels, sample_size), device=device)
+        # try to load in mean_silence.pt and scale_silence.pt from silence_dir to use as the initial audio
+        try:
+            silence_mean = torch.load(silence_dir + 'mean_silence.pt').to(device)
+            silence_scale = torch.load(silence_dir + 'scale_silence.pt').to(device)
+            inpaint_input = silence_mean + torch.randn((batch_size, model.io_channels, sample_size), device=device) * silence_scale
+            print("Loaded silence mean and scale for initial inpaint input")
+        except Exception as e:
+            print(f"Could not load silence mean and scale for initial inpaint input: {e}")
+            inpaint_input = torch.zeros((batch_size, model.io_channels, sample_size), device=device)
 
     conditioning_tensors['inpaint_mask'] = [mask]
     conditioning_tensors['inpaint_masked_input'] = [inpaint_input]

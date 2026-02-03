@@ -16,7 +16,8 @@ def random_inpaint_mask(
     fixed_mask_size: Optional[int] = None,
     outpainting_dropout_probs: Optional[Dict[str, float]] = None,
     silence_mean: Optional[torch.Tensor] = None,
-    silence_scale: Optional[torch.Tensor] = None
+    silence_scale: Optional[torch.Tensor] = None,
+    **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generates random inpainting masks for a batch of latent audio sequences.
@@ -131,6 +132,9 @@ def random_inpaint_mask(
 
         silence_mean_expanded = silence_mean.repeat(b, 1, 1).to(sequence.device)
         silence_scale_expanded = silence_scale.repeat(b, 1, 1).to(sequence.device)
+        # truncate to same shape
+        silence_mean_expanded = silence_mean_expanded[:, :, :sequence.shape[2]]
+        silence_scale_expanded = silence_scale_expanded[:, :, :sequence.shape[2]]
         silence_latents = silence_mean_expanded + torch.randn_like(sequence) * silence_scale_expanded
         sequence = sequence * final_dropout_mask + silence_latents * (1 - final_dropout_mask)
     masked_sequence = sequence * final_inpaint_mask

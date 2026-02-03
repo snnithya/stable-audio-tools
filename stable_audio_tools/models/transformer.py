@@ -20,11 +20,11 @@ except ImportError as e:
 
 from .utils import compile
 
-try: 
-    torch._dynamo.config.cache_size_limit = 5000
-    flex_attention_compiled = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
-except:
-    flex_attention_compiled = flex_attention
+# try: 
+    # torch._dynamo.config.cache_size_limit = 5000
+flex_attention_compiled = torch.compile(flex_attention)
+# except:
+    # flex_attention_compiled = flex_attention
 
 def checkpoint(function, *args, **kwargs):
     kwargs.setdefault("use_reentrant", False)
@@ -448,10 +448,14 @@ class Attention(nn.Module):
         x,
         context = None,
         rotary_pos_emb = None,
-        causal = None, 
+        causal = None,
         flex_attention_block_mask = None,
         flex_attention_score_mod = None,
-        flash_attn_sliding_window = None
+        flash_attn_sliding_window = None,
+        use_kv_cache = False,
+        kv_cache = None,
+        cache_key = None,
+        encoder_seq_len = None
     ):
         h, kv_h, has_context = self.num_heads, self.kv_heads, context is not None
 
