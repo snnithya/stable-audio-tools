@@ -354,6 +354,8 @@ class PreEncodedDataset(torch.utils.data.Dataset):
             if "seconds_total" not in info:
                 info["seconds_total"] = int(latents.size(1) * 2048 / info["sample_rate"])
             if "seconds_start" not in info:
+                # check if start exists
+                start = info.get("latent_crop_start", 0)
                 info["seconds_start"] = int(info.get("starting_point", 0) / info["sample_rate"]) + start * 2048 / info["sample_rate"]
             seconds_total = info["seconds_total"]
 

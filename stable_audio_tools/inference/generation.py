@@ -8,6 +8,7 @@ from torch.nn.functional import interpolate
 from .utils import prepare_audio
 from .sampling import sample, sample_k, sample_rf
 from ..data.utils import PadCrop
+from torch.nn.attention.flex_attention import create_block_mask, or_masks
 
 def generate_diffusion_uncond(
         model,
@@ -104,6 +105,7 @@ def generate_diffusion_cond(
         init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
         init_noise_level: float = 1.0,
         return_latents = False,
+        use_kv_cache: bool = False,
         **sampler_kwargs
         ) -> torch.Tensor: 
     """
@@ -180,11 +182,23 @@ def generate_diffusion_cond(
 
         init_audio = init_audio.repeat(batch_size, 1, 1)
 
-        sampler_kwargs["sigma_max"] = init_noise_level        
+        sampler_kwargs["sigma_max"] = init_noise_level
 
     model_dtype = next(model.model.parameters()).dtype
     noise = noise.type(model_dtype)
     conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in conditioning_inputs.items()}
+
+    # Initialize KV cache if enabled
+    kv_cache = None
+    if use_kv_cache:
+        kv_cache = {
+            'initialized': False,
+            'self_attn': {},
+            'cross_attn': {}
+        }
+        conditioning_inputs['use_kv_cache'] = True
+        conditioning_inputs['kv_cache'] = kv_cache
+
     # Now the generative AI part:
     # k-diffusion denoising process go!
 
@@ -236,6 +250,7 @@ def generate_diffusion_cond_inpaint(
         inpaint_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
         inpaint_mask = None,
         return_latents = False,
+        use_kv_cache: bool = False,
         **sampler_kwargs
         ) -> torch.Tensor: 
     """
@@ -370,12 +385,24 @@ def generate_diffusion_cond_inpaint(
     model_dtype = next(model.model.parameters()).dtype
     noise = noise.type(model_dtype)
     conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in conditioning_inputs.items()}
+
+    # Initialize KV cache if enabled
+    kv_cache = None
+    if use_kv_cache:
+        kv_cache = {
+            'initialized': False,
+            'self_attn': {},
+            'cross_attn': {}
+        }
+        conditioning_inputs['use_kv_cache'] = True
+        conditioning_inputs['kv_cache'] = kv_cache
+
     # Now the generative AI part:
     # k-diffusion denoising process go!
 
     diff_objective = model.diffusion_objective
 
-    if diff_objective == "v":    
+    if diff_objective == "v":
         # k-diffusion denoising process go!
         sampled = sample_k(model.model, noise, init_data=init_audio, steps=steps, **sampler_kwargs, **conditioning_inputs, **negative_conditioning_tensors, cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, device=device)
     elif diff_objective in ["rectified_flow", "rf_denoiser"]:
@@ -423,6 +450,9 @@ def generate_diffusion_cond_blockar(
         block_size: int = 98304,
         generation_length: int = 2097152,
         silence_dir: str = '/home/zachary/code/stable-audio-tools/notebooks/',
+        use_kv_cache: bool = False,
+        enc_enc: bool = False,
+        enc_enc_attention_pattern: tp.Optional[str] = None,
         **sampler_kwargs
     ) -> torch.Tensor: 
     '''
@@ -485,7 +515,7 @@ def generate_diffusion_cond_blockar(
 
         # For latent models, encode the initial audio into latents
         if model.pretransform is not None:
-            init_audio = model.pretransform.encode(init_audio)
+            init_audio = model.pretransform.encode(init_audio.to(next(model.pretransform.parameters()).dtype))
             
         init_audio = init_audio.repeat(batch_size, 1, 1)
 
@@ -506,6 +536,15 @@ def generate_diffusion_cond_blockar(
         try:
             silence_mean = torch.load(silence_dir + 'mean_silence.pt').to(device)
             silence_scale = torch.load(silence_dir + 'scale_silence.pt').to(device)
+            # truncate or extend to sample_size
+            if silence_mean.shape[2] > sample_size:
+                silence_mean = silence_mean[:, :, :sample_size]
+                silence_scale = silence_scale[:, :, :sample_size]
+            elif silence_mean.shape[2] < sample_size:
+                # repeat
+                repeat_factor = (sample_size + silence_mean.shape[2] - 1) // silence_mean.shape[2]
+                silence_mean = silence_mean.repeat(1, 1, repeat_factor)[:, :, :sample_size]
+                silence_scale = silence_scale.repeat(1, 1, repeat_factor)[:, :, :sample_size]
             inpaint_input = silence_mean + torch.randn((batch_size, model.io_channels, sample_size), device=device) * silence_scale
             print("Loaded silence mean and scale for initial inpaint input")
         except Exception as e:
@@ -514,6 +553,50 @@ def generate_diffusion_cond_blockar(
 
     conditioning_tensors['inpaint_mask'] = [mask]
     conditioning_tensors['inpaint_masked_input'] = [inpaint_input]
+    if enc_enc:
+        print("Using enc-enc attention with block size", block_size)
+        sampler_kwargs["enc_enc_mask"] = (1 - mask)
+        assert torch.all(sampler_kwargs["enc_enc_mask"][..., :sample_size - block_size] == 0), f"enc-enc mask should be 0 for the first sample_size - block_size samples, but got {sampler_kwargs['enc_enc_mask'][..., :sample_size+1 - block_size]}"
+        if enc_enc_attention_pattern is not None:
+            fixed_mask_size = sample_size - block_size
+            seq_len = sample_size
+            assert fixed_mask_size is not None, "fixed_mask_size must be specified in inpaint_mask_kwargs when using enc_enc"
+            print(f"Creating enc-enc self attention block mask with pattern {enc_enc_attention_pattern} and fixed mask size {fixed_mask_size} for sequence length {seq_len}")
+            match enc_enc_attention_pattern:
+                case "enc-dec":
+                    # if "postpend" in sampler_kwargs and sampler_kwargs["postpend"]:
+                    #     # we're moving the prepend cond to the end of the sequnce, so we need to roll the sequence by 1
+                    #     # basically like a modulo operation, the last position should be like the whole prefix
+                    #     def prefix_mask(b, h, q_idx, kv_idx):
+                    #         return (kv_idx + 1) % (seq_len+1) < fixed_mask_size
+
+                    #     def postfix_mask(b, h, q_idx, kv_idx):
+                    #         return (q_idx + 1) % (seq_len+1) >= fixed_mask_size
+                    # else:
+                    def prefix_mask(b, h, q_idx, kv_idx):
+                        return kv_idx < fixed_mask_size
+                    
+                    def postfix_mask(b, h, q_idx, kv_idx):
+                        return q_idx >= fixed_mask_size
+                case "block-causal":
+                    block_size = seq_len - fixed_mask_size # TODO: all this +1 bullshit is because of preprend conditioning the timestep, so all sequences are actually +1 longer
+                    # make prefix mask block causal
+                    def prefix_mask(b, h, q_idx, kv_idx):
+                        mod_idx = fixed_mask_size % block_size
+                        block_idx = (kv_idx - mod_idx) // block_size
+                        q_block_idx = (q_idx - mod_idx) // block_size
+                        return q_block_idx >= (block_idx)
+                    def postfix_mask(b, h, q_idx, kv_idx):
+                        return q_idx >= fixed_mask_size
+            
+            mask_mod = or_masks(prefix_mask, postfix_mask) 
+            # create the mask now
+            
+            
+            sampler_kwargs["self_attention_block_mask"] = create_block_mask(mask_mod, B=None, H=None, Q_LEN=seq_len+1, KV_LEN=seq_len+1, device=noise.device, _compile=True)
+            print('Created self attention block mask:')
+            print(sampler_kwargs["self_attention_block_mask"].to_string())
+
     conditioning_inputs = model.get_conditioning_inputs(conditioning_tensors)
 
     if negative_conditioning_tensors:
@@ -525,6 +608,17 @@ def generate_diffusion_cond_blockar(
     while total_generated < generation_length:
         noise = noise.type(model_dtype)
         conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in conditioning_inputs.items()}
+
+        # Initialize KV cache if enabled (reset for each block)
+        kv_cache = None
+        if use_kv_cache:
+            kv_cache = {
+                'initialized': False,
+                'self_attn': {},
+                'cross_attn': {}
+            }
+            conditioning_inputs['use_kv_cache'] = True
+            conditioning_inputs['kv_cache'] = kv_cache
 
         # k-diffusion denoising process go!
         diff_objective = model.diffusion_objective

@@ -28,6 +28,7 @@ class DiffusionTransformer(nn.Module):
         timestep_cond_type: tp.Literal["global", "input_concat"] = "global",
         timestep_embed_dim=None,
         diffusion_objective: tp.Literal["v", "rectified_flow", "rf_denoiser"] = "v",
+        postpend=False,
         **kwargs):
 
         super().__init__()
@@ -101,6 +102,7 @@ class DiffusionTransformer(nn.Module):
         dim_in = io_channels + self.input_concat_dim
 
         self.patch_size = patch_size
+        self.postpend = postpend
 
         # Transformer
 
@@ -136,9 +138,9 @@ class DiffusionTransformer(nn.Module):
         nn.init.zeros_(self.postprocess_conv.weight)
 
     def _forward(
-        self, 
-        x, 
-        t, 
+        self,
+        x,
+        t,
         mask=None,
         cross_attn_cond=None,
         cross_attn_cond_mask=None,
@@ -150,7 +152,12 @@ class DiffusionTransformer(nn.Module):
         return_info=False,
         exit_layer_ix=None,
         enc_enc_mask=None,
+        use_kv_cache=False,
+        kv_cache=None,
+        postpend=None,
         **kwargs):
+
+        postpend = self.postpend if postpend is None else postpend
 
         if cross_attn_cond is not None:
             cross_attn_cond = self.to_cond_embed(cross_attn_cond)
@@ -221,9 +228,30 @@ class DiffusionTransformer(nn.Module):
         if self.patch_size > 1:
             x = rearrange(x, "b (t p) c -> b t (c p)", p=self.patch_size)
 
+        # When KV cache is initialized, only pass decoder portion through the network
+        cache_is_initialized = use_kv_cache and kv_cache is not None and kv_cache.get('initialized', True)
+        if cache_is_initialized:
+            encoder_seq_len = kv_cache['encoder_seq_len']
+
+            # Slice x to decoder only
+            rotary_seq_len = x.shape[1] + prepend_length if prepend_inputs is not None else x.shape[1]
+            kwargs['rotary_seq_len'] = rotary_seq_len
+            x = x[:, encoder_seq_len:]
+
+            # Truncate input_add_emb to decoder portion (should be zeros there anyway)
+            if add_emb is not None:
+                add_emb = add_emb[:, encoder_seq_len:]
+
+            # Use standard bidirectional attention for decoder (no custom mask needed)
+            enc_enc_mask = None
+
+            # remove mask kwargs
+            if kwargs.get('self_attention_block_mask', None) is not None:
+                kwargs.pop('self_attention_block_mask') # this should turn off flex attention
+
         if self.transformer_type == "continuous_transformer":
             # Masks not currently implemented for continuous transformer
-            output = self.transformer(x, prepend_embeds=prepend_inputs, context=cross_attn_cond, return_info=return_info, exit_layer_ix=exit_layer_ix, input_add_emb=add_emb, enc_enc_mask=enc_enc_mask, **extra_args, **kwargs)
+            output = self.transformer(x, prepend_embeds=prepend_inputs, context=cross_attn_cond, return_info=return_info, exit_layer_ix=exit_layer_ix, input_add_emb=add_emb, enc_enc_mask=enc_enc_mask, use_kv_cache=use_kv_cache, kv_cache=kv_cache, postpend=postpend, **extra_args, **kwargs)
 
             if return_info:
                 output, info = output
@@ -235,16 +263,33 @@ class DiffusionTransformer(nn.Module):
                 else:
                     return output
 
-        output = rearrange(output, "b t c -> b c t")[:,:,prepend_length:]
+
+
+        if not postpend:
+            output = rearrange(output, "b t c -> b c t")[:,:,prepend_length:]
+        else:
+            output = rearrange(output, "b t c -> b c t")[:,:,:-prepend_length] if prepend_length > 0 else rearrange(output, "b t c -> b c t")
 
         if self.patch_size > 1:
             output = rearrange(output, "b (c p) t -> b c (t p)", p=self.patch_size)
 
         output = self.postprocess_conv(output) + output
 
+        # Cache encoder output on first pass, or restore it on subsequent passes
+        if use_kv_cache and kv_cache is not None:
+            if not kv_cache.get('initialized', False):
+                # First pass: cache encoder portion of output
+                encoder_seq_len = kv_cache.get('encoder_seq_len')
+                if encoder_seq_len is not None and encoder_seq_len > 0:
+                    kv_cache['encoder_output'] = output[..., :encoder_seq_len].detach()
+                kv_cache['initialized'] = True
+            elif 'encoder_output' in kv_cache:
+                # Subsequent passes: prepend cached encoder output to decoder output
+                encoder_output = kv_cache['encoder_output']
+                output = torch.cat([encoder_output, output], dim=-1)
+
         if return_info:
             return output, info
-
         return output
 
     def apg_project(self, v0, v1):
@@ -256,9 +301,9 @@ class DiffusionTransformer(nn.Module):
         return v0_parallel.to(dtype), v0_orthogonal.to(dtype)
 
     def forward(
-        self, 
-        x, 
-        t, 
+        self,
+        x,
+        t,
         cross_attn_cond=None,
         cross_attn_cond_mask=None,
         negative_cross_attn_cond=None,
@@ -278,6 +323,8 @@ class DiffusionTransformer(nn.Module):
         return_info=False,
         exit_layer_ix=None,
         enc_enc_mask=None,
+        use_kv_cache=False,
+        kv_cache=None,
         **kwargs):
 
 
@@ -323,17 +370,19 @@ class DiffusionTransformer(nn.Module):
             return self._forward(
                 x,
                 t,
-                cross_attn_cond=cross_attn_cond, 
-                cross_attn_cond_mask=cross_attn_cond_mask, 
-                input_concat_cond=input_concat_cond, 
+                cross_attn_cond=cross_attn_cond,
+                cross_attn_cond_mask=cross_attn_cond_mask,
+                input_concat_cond=input_concat_cond,
                 input_add_cond=input_add_cond,
-                global_embed=global_embed, 
-                prepend_cond=prepend_cond, 
+                global_embed=global_embed,
+                prepend_cond=prepend_cond,
                 prepend_cond_mask=prepend_cond_mask,
                 mask=mask,
                 return_info=return_info,
                 exit_layer_ix=exit_layer_ix,
                 enc_enc_mask=enc_enc_mask,
+                use_kv_cache=use_kv_cache,
+                kv_cache=kv_cache,
                 **kwargs
             )
 
@@ -442,18 +491,20 @@ class DiffusionTransformer(nn.Module):
                 batch_enc_enc_mask = None
             
             batch_output = self._forward(
-                batch_inputs, 
-                batch_timestep, 
-                cross_attn_cond=batch_cond, 
-                cross_attn_cond_mask=batch_cond_masks, 
-                mask = batch_masks, 
-                input_concat_cond=batch_input_concat_cond, 
+                batch_inputs,
+                batch_timestep,
+                cross_attn_cond=batch_cond,
+                cross_attn_cond_mask=batch_cond_masks,
+                mask = batch_masks,
+                input_concat_cond=batch_input_concat_cond,
                 input_add_cond=batch_input_add_cond,
                 global_embed = batch_global_cond,
                 prepend_cond = batch_prepend_cond,
                 prepend_cond_mask = batch_prepend_cond_mask,
                 return_info = return_info,
                 enc_enc_mask = batch_enc_enc_mask,
+                use_kv_cache=use_kv_cache,
+                kv_cache=kv_cache,
                 **kwargs)
 
             if return_info:
@@ -482,15 +533,17 @@ class DiffusionTransformer(nn.Module):
             return self._forward(
                 x,
                 t,
-                cross_attn_cond=cross_attn_cond, 
-                cross_attn_cond_mask=cross_attn_cond_mask, 
-                input_concat_cond=input_concat_cond, 
+                cross_attn_cond=cross_attn_cond,
+                cross_attn_cond_mask=cross_attn_cond_mask,
+                input_concat_cond=input_concat_cond,
                 input_add_cond=input_add_cond,
-                global_embed=global_embed, 
-                prepend_cond=prepend_cond, 
+                global_embed=global_embed,
+                prepend_cond=prepend_cond,
                 prepend_cond_mask=prepend_cond_mask,
                 mask=mask,
                 return_info=return_info,
                 enc_enc_mask=enc_enc_mask,
+                use_kv_cache=use_kv_cache,
+                kv_cache=kv_cache,
                 **kwargs
             )

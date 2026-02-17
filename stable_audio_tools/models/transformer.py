@@ -342,25 +342,17 @@ class Attention(nn.Module):
         self.dim = dim
         self.dim_heads = dim_heads
 
-        self.differential = differential
-
         dim_kv = dim_context if dim_context is not None else dim
-        
+
         self.num_heads = dim // dim_heads
         self.kv_heads = dim_kv // dim_heads
 
         if dim_context is not None:
-            if differential:
-                self.to_q = nn.Linear(dim, dim * 2, bias=False)
-                self.to_kv = nn.Linear(dim_kv, dim_kv * 3, bias=False)
-            else:
-                self.to_q = nn.Linear(dim, dim, bias=False)
-                self.to_kv = nn.Linear(dim_kv, dim_kv * 2, bias=False)
+            # Cross-attention: use separate projections
+            self.to_q = nn.Linear(dim, dim, bias=False)
+            self.to_kv = nn.Linear(dim_kv, dim_kv * 2, bias=False)
         else:
-            if differential:
-                self.to_qkv = nn.Linear(dim, dim * 5, bias=False)
-            else:
-                self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
+            self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
 
         self.to_out = nn.Linear(dim, dim, bias=False)
 
@@ -394,6 +386,116 @@ class Attention(nn.Module):
         self.causal = causal
         if causal:
             print('Using `causal` argument disables FlexAttention. If you want to use them together, incorporate causal masking into `flex_attention_block_mask`.')
+
+    def _split_qkv_projections_for_cache(self):
+        """
+        Split fused to_qkv projection into separate to_q and to_kv for KV caching.
+        This allows computing only Q for the encoder portion and only K,V for the decoder.
+        """
+        if hasattr(self, 'to_q') and hasattr(self, 'to_kv'):
+            # Already split
+            return
+
+        if not hasattr(self, 'to_qkv'):
+            raise RuntimeError("Cannot split projections: no to_qkv found")
+
+        # Extract weights from fused projection
+        # to_qkv projects to [q, k, v] each of size dim
+        # need to handle lora support
+        if type(self.to_qkv) == nn.Linear:
+            qkv_weight = self.to_qkv.weight.data  # Shape: [dim * 3, dim]
+            dim = self.dim
+
+            # Split into q, k, v weights
+            q_weight = qkv_weight[:dim, :]      # First dim rows
+            kv_weight = qkv_weight[dim:, :]     # Remaining 2*dim rows (k and v)
+
+            # Create new linear layers
+            self.to_q = nn.Linear(dim, dim, bias=False)
+            self.to_kv = nn.Linear(dim, dim * 2, bias=False)
+
+            # Copy weights
+            self.to_q.weight.data = q_weight
+            self.to_kv.weight.data = kv_weight
+
+            # Move to same device as original
+            self.to_q = self.to_q.to(self.to_qkv.weight.device)
+            self.to_kv = self.to_kv.to(self.to_qkv.weight.device)
+
+            # Delete the fused projection to save memory
+            del self.to_qkv
+        else:
+            # Handle LoRA layer
+            from ..loraw.modules import LoRALinear
+
+            if not isinstance(self.to_qkv, LoRALinear):
+                raise RuntimeError(f"Unsupported to_qkv type for splitting: {type(self.to_qkv)}")
+
+            dim = self.dim
+            lora_dim = self.to_qkv.lora_dim
+
+            # Split original module weights
+            original_qkv = self.to_qkv.original_module
+            qkv_weight = original_qkv.weight.data  # Shape: [dim * 3, dim]
+            q_weight = qkv_weight[:dim, :]         # First dim rows
+            kv_weight = qkv_weight[dim:, :]        # Remaining 2*dim rows (k and v)
+
+            # Create new original modules
+            original_q = nn.Linear(dim, dim, bias=False)
+            original_kv = nn.Linear(dim, dim * 2, bias=False)
+            original_q.weight.data = q_weight
+            original_kv.weight.data = kv_weight
+
+            # Split LoRA weights
+            # lora_up needs splitting (output is [q, k, v])
+            lora_up_weight = self.to_qkv.lora_up.weight.data  # Shape: [dim * 3, lora_dim]
+            lora_up_q_weight = lora_up_weight[:dim, :]        # Q portion
+            lora_up_kv_weight = lora_up_weight[dim:, :]       # K,V portion
+
+            # Create LoRA modules for to_q and to_kv
+            self.to_q = LoRALinear(
+                lora_name="to_q",
+                original_module=original_q,
+                decompose=self.to_qkv.dora_mag is not None,
+                lora_dim=lora_dim,
+                alpha=self.to_qkv.scale * lora_dim,  # Reconstruct alpha from scale
+                dropout=self.to_qkv.dropout,
+                module_dropout=self.to_qkv.module_dropout,
+                multiplier=self.to_qkv.multiplier
+            )
+
+            self.to_kv = LoRALinear(
+                lora_name="to_kv",
+                original_module=original_kv,
+                decompose=self.to_qkv.dora_mag is not None,
+                lora_dim=lora_dim,
+                alpha=self.to_qkv.scale * lora_dim,
+                dropout=self.to_qkv.dropout,
+                module_dropout=self.to_qkv.module_dropout,
+                multiplier=self.to_qkv.multiplier
+            )
+
+            # Copy lora_up weights (split between Q and KV)
+            self.to_q.lora_up.weight.data = lora_up_q_weight
+            self.to_kv.lora_up.weight.data = lora_up_kv_weight
+
+            # Copy lora_down weights (shared input, both get full copy)
+            self.to_q.lora_down.weight.data = self.to_qkv.lora_down.weight.data.clone()
+            self.to_kv.lora_down.weight.data = self.to_qkv.lora_down.weight.data.clone()
+
+            # Split dora_mag if present
+            if self.to_qkv.dora_mag is not None:
+                dora_weight = self.to_qkv.dora_mag.weight.data  # Shape: [dim * 3, 1]
+                self.to_q.dora_mag.weight.data = dora_weight[:dim, :]
+                self.to_kv.dora_mag.weight.data = dora_weight[dim:, :]
+
+            # Move to same device as original
+            device = original_qkv.weight.device
+            self.to_q = self.to_q.to(device)
+            self.to_kv = self.to_kv.to(device)
+
+            # Delete the fused projection to save memory
+            del self.to_qkv
 
     @compile
     def apply_qk_layernorm(self, q, k):
@@ -461,30 +563,58 @@ class Attention(nn.Module):
 
         kv_input = context if has_context else x
 
-        if hasattr(self, 'to_q'):
-            # Use separate linear projections for q and k/v
-            if self.differential:
-                q, q_diff = self.to_q(x).chunk(2, dim=-1)
-                q, q_diff = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, q_diff))
-                q = torch.stack([q, q_diff], dim = 1)
-                k, k_diff, v = self.to_kv(kv_input).chunk(3, dim=-1)
-                k, k_diff, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = kv_h), (k, k_diff, v))
-                k = torch.stack([k, k_diff], dim = 1)
+        # Determine if we're using KV caching
+        using_cache = use_kv_cache and kv_cache is not None and cache_key is not None
+        cache_initialized = using_cache and kv_cache.get('initialized', False)
+        is_cross_attn = has_context
+
+        # Split fused projection if using cache for first time
+        if using_cache and not cache_initialized and not is_cross_attn:
+            if not hasattr(self, 'to_q') and hasattr(self, 'to_qkv'):
+                # print(f"Initializing KV cache for first time, splitting fused to_qkv projection for {cache_key}")
+                self._split_qkv_projections_for_cache()
+
+        # Compute Q,K,V with caching support
+        if using_cache and cache_initialized:
+            # Cache is initialized - reuse cached K,V where possible
+            if is_cross_attn:
+                # Cross-attention: reuse entire cached K,V (text conditioning is constant)
+                attn_type = 'cross_attn'
+                k = kv_cache[attn_type][cache_key]['k']
+                v = kv_cache[attn_type][cache_key]['v']
+                # Always compute Q (needed for every forward pass)
+                q = self.to_q(x)
+                q = rearrange(q, 'b n (h d) -> b h n d', h = h)
             else:
+                # Self-attention: reuse encoder K,V, compute decoder K,V
+                # Note: x is already sliced to decoder-only when cache is initialized
+                attn_type = 'self_attn'
+
+                # Get cached encoder portion
+                k_encoder = kv_cache[attn_type][cache_key]['k']
+                v_encoder = kv_cache[attn_type][cache_key]['v']
+
+                # Compute Q and K,V for decoder (x is already decoder-only)
+                q = self.to_q(x)
+                q = rearrange(q, 'b n (h d) -> b h n d', h = h)
+
+                k_decoder, v_decoder = self.to_kv(x).chunk(2, dim=-1)
+                k_decoder, v_decoder = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = kv_h), (k_decoder, v_decoder))
+
+                # Concatenate encoder + decoder
+                k = torch.cat([k_encoder, k_decoder], dim=2)
+                v = torch.cat([v_encoder, v_decoder], dim=2)
+        else:
+            # Normal path: compute full K,V (no cache or first pass)
+            if hasattr(self, 'to_q'):
                 q = self.to_q(x)
                 q = rearrange(q, 'b n (h d) -> b h n d', h = h)
                 k, v = self.to_kv(kv_input).chunk(2, dim=-1)
                 k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = kv_h), (k, v))
-        else:
-            # Use fused linear projection
-            if self.differential:
-                q, k, v, q_diff, k_diff = self.to_qkv(x).chunk(5, dim=-1)
-                q, k, v, q_diff, k_diff  = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v, q_diff, k_diff))
-                q = torch.stack([q, q_diff], dim = 1)
-                k = torch.stack([k, k_diff], dim = 1)
             else:
                 q, k, v = self.to_qkv(x).chunk(3, dim=-1)
                 q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+                # print(k[:, :, 1:208].mean(), v[:, :, 1:208].mean())
 
         # Normalize q and k for cosine sim attention
         if self.qk_norm == "l2":
@@ -500,17 +630,64 @@ class Attention(nn.Module):
             q = q.to(torch.float32)
             k = k.to(torch.float32)
             freqs = freqs.to(torch.float32)
-            if q.shape[-2] >= k.shape[-2]:
+            if using_cache and cache_initialized:
+                ratio = 1
+                q_freqs, k_freqs = freqs, freqs
+            elif q.shape[-2] >= k.shape[-2]:
                 ratio = q.shape[-2] / k.shape[-2]
                 q_freqs, k_freqs = freqs, ratio * freqs
             else:
                 ratio = k.shape[-2] / q.shape[-2]
                 q_freqs, k_freqs = ratio * freqs, freqs
-            q = apply_rotary_pos_emb(q, q_freqs)
-            k = apply_rotary_pos_emb(k, k_freqs)
+            # print(q_freqs.shape, k_freqs.shape, q.shape)
+
+            # Special handling for cached self-attention with encoder/decoder split
+            if using_cache and cache_initialized and not is_cross_attn:
+                cached_encoder_seq_len = kv_cache['encoder_seq_len']
+
+                # Q is decoder-only and needs RoPE with position offset
+                q_freqs_decoder = q_freqs[cached_encoder_seq_len:]
+                q = apply_rotary_pos_emb(q, q_freqs_decoder)
+
+                # K encoder portion already has RoPE applied (from cache)
+                # Only apply RoPE to decoder portion with position offset
+                k_decoder = k[:, :, cached_encoder_seq_len:]
+                k_freqs_decoder = k_freqs[cached_encoder_seq_len:]
+                k_decoder = apply_rotary_pos_emb(k_decoder, k_freqs_decoder)
+
+                # Concatenate: [cached_encoder_k (already has RoPE), decoder_k (just applied RoPE)]
+                k = torch.cat([k[:, :, :cached_encoder_seq_len], k_decoder], dim=2)
+            else:
+                # Normal path: apply RoPE to full sequences
+                q = apply_rotary_pos_emb(q, q_freqs)
+                k = apply_rotary_pos_emb(k, k_freqs)
+                
+
             q = q.to(v.dtype)
             k = k.to(v.dtype)
-        
+
+        # Populate cache on first pass (after RoPE has been applied)
+        if using_cache and not cache_initialized:
+            if is_cross_attn:
+                # Cache entire cross-attention K,V
+                attn_type = 'cross_attn'
+                if attn_type not in kv_cache:
+                    kv_cache[attn_type] = {}
+                kv_cache[attn_type][cache_key] = {
+                    'k': k.detach(),
+                    'v': v.detach()
+                }
+            else:
+                # Cache encoder portion of self-attention K,V
+                attn_type = 'self_attn'
+                if attn_type not in kv_cache:
+                    kv_cache[attn_type] = {}
+                if encoder_seq_len is not None and encoder_seq_len > 0:
+                    kv_cache[attn_type][cache_key] = {
+                        'k': k[:, :, :encoder_seq_len].detach(),
+                        'v': v[:, :, :encoder_seq_len].detach()
+                    }
+
         n, device = q.shape[-2], q.device
 
         causal = self.causal if causal is None else causal
@@ -518,14 +695,7 @@ class Attention(nn.Module):
         if n == 1 and causal:
             causal = False
 
-        if self.differential:
-            q, q_diff = q.unbind(dim = 1)
-            k, k_diff = k.unbind(dim = 1)
-            out = self.apply_attn(q, k, v,  causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window)
-            out_diff = self.apply_attn(q_diff, k_diff, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window)
-            out = out - out_diff
-        else:
-            out = self.apply_attn(q, k, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window)
+        out = self.apply_attn(q, k, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window)
 
         # merge heads
         out = rearrange(out, ' b h n d -> b n (h d)')
@@ -672,7 +842,11 @@ class TransformerBlock(nn.Module):
         cross_attention_block_mask = None,
         cross_attention_score_mod = None,
         self_attention_flash_sliding_window = None,
-        cross_attention_flash_sliding_window = None
+        cross_attention_flash_sliding_window = None,
+        use_kv_cache = False,
+        kv_cache = None,
+        layer_ix = None,
+        encoder_seq_len = None
     ):
         if rotary_pos_emb is None and self.add_rope:
             rotary_pos_emb = self.rope.forward_from_seq_len(x.shape[-2])
@@ -685,13 +859,13 @@ class TransformerBlock(nn.Module):
             residual = x
             x = self.pre_norm(x)
             x = x * (1 + scale_self) + shift_self
-            x = self.self_attn(x, rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window)
+            x = self.self_attn(x, rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, cache_key = layer_ix, encoder_seq_len = encoder_seq_len)
             x = x * torch.sigmoid(1 - gate_self)
             x = self.self_attn_scale(x)
             x = x + residual
 
             if context is not None and self.cross_attend:
-                x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, cache_key = layer_ix))
             
             if self.conformer is not None:
                 x = x + self.conformer_scale(self.conformer(x))
@@ -706,10 +880,10 @@ class TransformerBlock(nn.Module):
             x = x + residual
 
         else:
-            x = x + self.self_attn_scale(self.self_attn(self.pre_norm(x), rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window))
+            x = x + self.self_attn_scale(self.self_attn(self.pre_norm(x), rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, cache_key = layer_ix, encoder_seq_len = encoder_seq_len))
 
             if context is not None and self.cross_attend:
-                x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, cache_key = layer_ix))
                     
             if self.conformer is not None:
                 x = x + self.conformer_scale(self.conformer(x))
@@ -808,6 +982,10 @@ class ContinuousTransformer(nn.Module):
         exit_layer_ix = None,
         input_add_emb = None,
         enc_enc_mask = None,
+        use_kv_cache = False,
+        kv_cache = None,
+        postpend=None,
+        rotary_seq_len = None,
         **kwargs
     ):
         batch, seq, device = *x.shape[:2], x.device
@@ -836,14 +1014,23 @@ class ContinuousTransformer(nn.Module):
 
             assert prepend_dim == x.shape[-1], 'prepend dimension must match sequence dimension'
 
-            x = torch.cat((prepend_embeds, x), dim = -2)
+            if not postpend:
+                x = torch.cat((prepend_embeds, x), dim = -2)
+            else:
+                x = torch.cat((x, prepend_embeds), dim = -2)
 
         if self.num_memory_tokens > 0:
             memory_tokens = self.memory_tokens.expand(batch, -1, -1)
             x = torch.cat((memory_tokens, x), dim=1)
 
         if self.rotary_pos_emb is not None:
-            rotary_pos_emb = self.rotary_pos_emb.forward_from_seq_len(x.shape[1])
+            rotary_pos_emb = self.rotary_pos_emb.forward_from_seq_len(x.shape[1] if rotary_seq_len is None else rotary_seq_len)
+            if postpend:
+                # If postpending, we need to shift the RoPE frequencies such that the prepend_cond tokens (which are now at the end of the sequence) get the correct RoPE frequencies
+                # since they are expecting to be at the beginning of the sequence. This is done by rolling the RoPE frequencies by the length of the postpended tokens.
+                rolled_freqs_0 = torch.roll(rotary_pos_emb[0], shifts=-prepend_length, dims=0)
+                rotary_pos_emb = (rolled_freqs_0, rotary_pos_emb[1])
+
         else:
             rotary_pos_emb = None
 
@@ -853,13 +1040,28 @@ class ContinuousTransformer(nn.Module):
         if global_cond is not None and self.global_cond_embedder is not None:
             global_cond = self.global_cond_embedder(global_cond)
 
+        # Extract encoder sequence length from enc_enc_mask for KV caching
+        encoder_seq_len = None
+        if use_kv_cache and enc_enc_mask is not None:
+            # enc_enc_mask shape: (batch, seq, channels) after transpose at line 1057
+            # Encoder portion has mask=1, decoder has mask=0
+            encoder_seq_len = 208
+
+        # Initialize KV cache structure on first use
+        if use_kv_cache and kv_cache is not None:
+            if not kv_cache.get('initialized', False):
+                kv_cache['self_attn'] = {}
+                kv_cache['cross_attn'] = {}
+                kv_cache['encoder_seq_len'] = encoder_seq_len
+
+
         # Iterate over the transformer layers
         for layer_ix, layer in enumerate(self.layers):
 
             if use_checkpointing:
-                x = checkpoint(layer, x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, self_attention_flash_sliding_window = self.sliding_window, **kwargs)
+                x = checkpoint(layer, x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, self_attention_flash_sliding_window = self.sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, layer_ix = layer_ix, encoder_seq_len = encoder_seq_len, **kwargs)
             else:
-                x = layer(x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, self_attention_flash_sliding_window = self.sliding_window, **kwargs)
+                x = layer(x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, self_attention_flash_sliding_window = self.sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, layer_ix = layer_ix, encoder_seq_len = encoder_seq_len, **kwargs)
 
             if return_info:
                 info["hidden_states"].append(x)
