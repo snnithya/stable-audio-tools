@@ -95,7 +95,7 @@ def truncated_logistic_normal_rescaled(shape, left_trunc=0.075, right_trunc=1):
     return rescaled_samples
 
 @torch.no_grad()
-def sample_discrete_euler(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, dist_shift=None, disable_tqdm=False, inpaint_masked_input=None, inpaint_mask=None, **extra_args):
+def sample_discrete_euler(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, dist_shift=None, disable_tqdm=True, inpaint_masked_input=None, inpaint_mask=None, **extra_args):
     """Draws samples from a model given starting noise. Euler method"""
 
     assert steps is not None or sigmas is not None, "Either steps or sigmas must be provided"
@@ -183,7 +183,7 @@ def sample_rk4(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, di
     return x
 
 @torch.no_grad()
-def sample_flow_dpmpp(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, dist_shift=None, disable_tqdm=False, **extra_args):
+def sample_flow_dpmpp(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, dist_shift=None, disable_tqdm=True, **extra_args):
     """Draws samples from a model given starting noise. DPM-Solver++ for RF models"""
 
     assert steps is not None or sigmas is not None, "Either steps or sigmas must be provided"

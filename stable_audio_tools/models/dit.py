@@ -155,6 +155,7 @@ class DiffusionTransformer(nn.Module):
         use_kv_cache=False,
         kv_cache=None,
         postpend=None,
+        prefill=False,
         **kwargs):
 
         postpend = self.postpend if postpend is None else postpend
@@ -228,8 +229,47 @@ class DiffusionTransformer(nn.Module):
         if self.patch_size > 1:
             x = rearrange(x, "b (t p) c -> b t (c p)", p=self.patch_size)
 
-        # When KV cache is initialized, only pass decoder portion through the network
-        cache_is_initialized = use_kv_cache and kv_cache is not None and kv_cache.get('initialized', True)
+        # Prefill: if KV cache exists but not yet initialized, run encoder-only pass to populate it.
+        # This lets all N denoising steps use fast decoder-only flash attention instead of flex attention.
+        if use_kv_cache and kv_cache is not None and not kv_cache.get('initialized', False) and prefill:
+            enc_seq_len_prefill = kv_cache.get('encoder_seq_len')
+            if enc_seq_len_prefill is None and enc_enc_mask is not None:
+                # raw_len = int((enc_enc_mask[0, 0, :] == 0).sum().item())
+                # enc_seq_len_prefill = raw_len // self.patch_size
+                kv_cache['encoder_seq_len'] = 208 #TODO hardcoded for now, need to figure out a good way to determine this dynamically based on the enc_enc_mask or input length but not trigger graph recompilation
+
+            if enc_seq_len_prefill is not None and enc_seq_len_prefill > 0:
+                x_enc = x[:, :enc_seq_len_prefill]
+                add_emb_enc = add_emb[:, :enc_seq_len_prefill] if add_emb is not None else None
+                # Exclude flex-attention block mask — use standard flash attention for prefill
+                if kwargs.get('self_attention_block_mask', None) is not None:
+                    kwargs.pop('self_attention_block_mask') # this should turn off flex attention
+                enc_out = self.transformer(
+                    x_enc,
+                    prepend_embeds=prepend_inputs,
+                    context=cross_attn_cond,
+                    return_info=False,
+                    input_add_emb=add_emb_enc,
+                    enc_enc_mask=None,
+                    use_kv_cache=True,
+                    kv_cache=kv_cache,
+                    postpend=postpend,
+                    **extra_args,
+                    **kwargs,
+                )
+                # Run encoder output through the same post-processing pipeline, then cache it
+                if not postpend:
+                    enc_out = rearrange(enc_out, "b t c -> b c t")[:, :, prepend_length:]
+                else:
+                    enc_out = rearrange(enc_out, "b t c -> b c t")[:, :, :-prepend_length] if prepend_length > 0 else rearrange(enc_out, "b t c -> b c t")
+                if self.patch_size > 1:
+                    enc_out = rearrange(enc_out, "b (c p) t -> b c (t p)", p=self.patch_size)
+                enc_out = self.postprocess_conv(enc_out) + enc_out
+                kv_cache['encoder_output'] = enc_out.detach()
+                kv_cache['initialized'] = True
+
+        # When KV cache is initialized (by prefill above or previous call), only pass decoder portion through the network
+        cache_is_initialized = use_kv_cache and kv_cache is not None and kv_cache.get('initialized', False)
         if cache_is_initialized:
             encoder_seq_len = kv_cache['encoder_seq_len']
 

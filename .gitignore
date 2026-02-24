@@ -5,7 +5,7 @@ __pycache__/
 LoRAW
 # C extensions
 *.so
-
+*.safetensors
 # Distribution / packaging
 .Python
 build/

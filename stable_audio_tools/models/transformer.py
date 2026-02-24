@@ -1040,19 +1040,24 @@ class ContinuousTransformer(nn.Module):
         if global_cond is not None and self.global_cond_embedder is not None:
             global_cond = self.global_cond_embedder(global_cond)
 
-        # Extract encoder sequence length from enc_enc_mask for KV caching
+        # Extract encoder sequence length for KV caching
         encoder_seq_len = None
-        if use_kv_cache and enc_enc_mask is not None:
-            # enc_enc_mask shape: (batch, seq, channels) after transpose at line 1057
-            # Encoder portion has mask=1, decoder has mask=0
-            encoder_seq_len = 208
+        if use_kv_cache and kv_cache is not None:
+            if 'encoder_seq_len' in kv_cache:
+                # Already set (e.g., by prefill or by dit.py before calling transformer)
+                encoder_seq_len = kv_cache['encoder_seq_len']
+            elif enc_enc_mask is not None:
+                # Compute from enc_enc_mask: 0 = encoder (zeroed out), 1 = decoder
+                # enc_enc_mask shape before transpose: (batch, 1, seq)
+                encoder_seq_len = 208 #TODO: hardcoded for now, but could be computed from enc_enc_mask if needed
 
         # Initialize KV cache structure on first use
         if use_kv_cache and kv_cache is not None:
             if not kv_cache.get('initialized', False):
                 kv_cache['self_attn'] = {}
                 kv_cache['cross_attn'] = {}
-                kv_cache['encoder_seq_len'] = encoder_seq_len
+                if 'encoder_seq_len' not in kv_cache:
+                    kv_cache['encoder_seq_len'] = encoder_seq_len
 
 
         # Iterate over the transformer layers

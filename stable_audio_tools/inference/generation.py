@@ -453,6 +453,7 @@ def generate_diffusion_cond_blockar(
         use_kv_cache: bool = False,
         enc_enc: bool = False,
         enc_enc_attention_pattern: tp.Optional[str] = None,
+        speedtest: bool = False,
         **sampler_kwargs
     ) -> torch.Tensor: 
     '''
@@ -634,8 +635,26 @@ def generate_diffusion_cond_blockar(
             if "rho" in sampler_kwargs:
                 del sampler_kwargs["rho"]
 
-            sampled = sample_rf(model.model, noise, steps=steps, **sampler_kwargs, **conditioning_inputs, **negative_conditioning_tensors, cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, device=device, inpaint_masked_input=inpaint_input, inpaint_mask=mask)
-       
+            if speedtest:
+                n_warmup = 10
+                n_iters = 100
+                # warmup
+                for _ in range(n_warmup):
+                    _ = sample_rf(model.model, noise, steps=steps, **sampler_kwargs, **conditioning_inputs, **negative_conditioning_tensors, cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, device=device, inpaint_masked_input=inpaint_input, inpaint_mask=mask)
+                torch.cuda.synchronize()
+                t0 = torch.cuda.Event(enable_timing=True)
+                t1 = torch.cuda.Event(enable_timing=True)
+                t0.record()
+                for _ in range(n_iters):
+                    _ = sample_rf(model.model, noise, steps=steps, **sampler_kwargs, **conditioning_inputs, **negative_conditioning_tensors, cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, device=device, inpaint_masked_input=inpaint_input, inpaint_mask=mask)
+                t1.record()
+                torch.cuda.synchronize()
+                print(f"Average inference time per block: {t0.elapsed_time(t1) / n_iters} ms")
+                return
+
+            else:
+                sampled = sample_rf(model.model, noise, steps=steps, **sampler_kwargs, **conditioning_inputs, **negative_conditioning_tensors, cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, device=device, inpaint_masked_input=inpaint_input, inpaint_mask=mask)
+        
        # Get the last block_size samples from sampled
         generated_block = sampled[:, :, -block_size:]
         generated_audio.append(generated_block.detach())
