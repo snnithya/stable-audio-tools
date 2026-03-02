@@ -226,7 +226,7 @@ def sample_flow_dpmpp(model, x, steps=None, sigma_max=1, sigmas=None, callback=N
     return x
 
 @torch.no_grad()
-def sample_flow_pingpong(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, dist_shift=None, **extra_args):
+def sample_flow_pingpong(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, dist_shift=None, inpaint_masked_input=None, inpaint_mask=None, **extra_args):
     """Draws samples from a model given starting noise. Ping-pong sampling for distilled models"""
 
     assert steps is not None or sigmas is not None, "Either steps or sigmas must be provided"
@@ -247,12 +247,20 @@ def sample_flow_pingpong(model, x, steps=None, sigma_max=1, sigmas=None, callbac
 
     for i in trange(len(t) - 1, disable=False):
 
+        if inpaint_mask is not None and inpaint_masked_input is not None:
+            # add noise to the masked input according to the current sigma
+            noised_masked_input = inpaint_masked_input * (1 - t[i]) + torch.randn_like(x) * t[i]
+            x = x * (1 - inpaint_mask) + noised_masked_input * inpaint_mask
+
         denoised = x - t[i] * model(x, t[i] * ts, **extra_args)
         if callback is not None:
             callback({'x': x, 'i': i, 't': t[i], 'sigma': t[i], 'sigma_hat': t[i], 'denoised': denoised})
 
         t_next = t[i + 1]
         x = (1-t_next) * denoised + t_next * torch.randn_like(x)
+
+    if inpaint_mask is not None and inpaint_masked_input is not None:
+        x = x * (1 - inpaint_mask) + inpaint_masked_input * inpaint_mask
 
     return x
 

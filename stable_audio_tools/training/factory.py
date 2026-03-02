@@ -1,3 +1,5 @@
+import json
+
 import torch
 from torch.nn import Parameter
 from ..models.factory import create_model_from_config
@@ -64,8 +66,6 @@ def create_training_wrapper_from_config(model_config, model):
     elif model_type in ['diffusion_cond', 'diffusion_cond_inpaint']:
        
         if "arc" in training_config:
-            from .arc import ARCTrainingWrapper
-
             arc_config = training_config["arc"]
 
             teacher_model_config = arc_config.get("teacher_model", None)
@@ -90,14 +90,20 @@ def create_training_wrapper_from_config(model_config, model):
             if discriminator_model_config is None and arc_config.get("use_model_as_discriminator", False):
                 discriminator_model_config = model_config
 
+            if type(discriminator_model_config) == str:
+                # its a path, load it!
+                discriminator_model_config = json.load(open(discriminator_model_config))
+
             if discriminator_model_config is not None:
                 discriminator = create_model_from_config(discriminator_model_config)
 
                 discriminator_model_ckpt = arc_config.get("discriminator_base_ckpt", None)
                 if discriminator_model_ckpt is not None:
                     discriminator.load_state_dict(torch.load(discriminator_model_ckpt, weights_only=True)["state_dict"], strict=False)
-
-            return ARCTrainingWrapper(
+                del discriminator.pretransform
+                torch.cuda.empty_cache()
+ 
+            wrapper_kwargs = dict(
                 model=model,
                 teacher_model=teacher_model,
                 discriminator=discriminator,
@@ -109,8 +115,16 @@ def create_training_wrapper_from_config(model_config, model):
                 timestep_sampler=training_config.get("timestep_sampler", "uniform"),
                 clip_grad_norm=training_config.get("clip_grad_norm", 0.0),
                 trim_config=training_config.get("trim_config", None),
-                inpainting_config=training_config.get("inpainting", None)
+                inpainting_config=training_config.get("inpainting", None),
+                enc_enc=training_config.get("enc_enc", False)
             )
+
+            if "self_forcing" in arc_config:
+                from .arc import SelfForcingARCTrainingWrapper
+                return SelfForcingARCTrainingWrapper(**wrapper_kwargs)
+            else:
+                from .arc import ARCTrainingWrapper
+                return ARCTrainingWrapper(**wrapper_kwargs)
 
         from .diffusion import DiffusionCondTrainingWrapper
         return DiffusionCondTrainingWrapper(

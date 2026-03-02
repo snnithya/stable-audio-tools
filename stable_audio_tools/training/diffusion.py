@@ -725,6 +725,9 @@ class DiffusionCondDemoCallback(pl.Callback):
             # Get metadata from the batch
             demo_cond = batch[1][:self.num_demos]
 
+        # Check if this is a self-forcing ARC module with full rollout support
+        is_self_forcing = hasattr(module, "generate_demo_rollout") and hasattr(module, "context_size") and module.context_size is not None
+
         if module.diffusion.pretransform is not None:
             demo_samples = demo_samples // module.diffusion.pretransform.downsampling_ratio
 
@@ -735,91 +738,134 @@ class DiffusionCondDemoCallback(pl.Callback):
             with torch.cuda.amp.autocast():
                 conditioning = module.diffusion.conditioner(demo_cond, module.device)
 
-            if module.inpainting_config is not None:
+            if is_self_forcing:
+                # Self-forcing ARC: generate full multi-chunk rollout and log context+rollout together
+                print(f"Generating self-forcing demo rollout ({module.n_rollout_chunks} chunks of {module.chunk_size} latents)")
 
-                padding_masks = torch.stack([md["padding_mask"][0] for md in demo_cond], dim=0).to(module.device) # Shape (batch_size, sequence_length)
+                diffusion_input = batch[0][:self.num_demos].to(module.device)
 
-                # Create a mask of random length for a random slice of the input
-                inpaint_masked_input, inpaint_mask = random_inpaint_mask(batch[0][:self.num_demos], padding_masks=padding_masks, **module.inpaint_mask_kwargs, silence_mean=module.silence_mean, silence_scale=module.silence_scale)
-
-                conditioning['inpaint_mask'] = [inpaint_mask]
-                conditioning['inpaint_masked_input'] = [inpaint_masked_input]
-
-            cond_inputs = module.diffusion.get_conditioning_inputs(conditioning)
-
-            if self.display_audio_cond:
-                audio_inputs = torch.cat([cond["audio"] for cond in demo_cond], dim=0)
-                audio_inputs = rearrange(audio_inputs, 'b d n -> d (b n)')
-
-                filename = f'demo_audio_cond_{trainer.global_step:08}.wav'
-                audio_inputs = audio_inputs.to(torch.float32).div(torch.max(torch.abs(audio_inputs))).mul(32767).to(torch.int16).cpu()
-                torchaudio.save(filename, audio_inputs, self.sample_rate)
-                log_audio(trainer.logger, f'demo_audio_cond', filename, self.sample_rate)
-                log_image(trainer.logger, f"demo_audio_cond_melspec_left", audio_spectrogram_image(audio_inputs))
-
-            # Pre-generation conditioning display
-            if self.cond_display_configs is not None:
-                for cond_display_config in self.cond_display_configs:
-                    cond_id = cond_display_config.get("id", None)
-                    assert cond_id is not None, "cond_display_configs must have an 'id' field"
-
-                    cond_type = cond_display_config.get("type", None)
-                    assert cond_type is not None, "cond_display_configs must have a 'type' field"
-
-                    if cond_type == "audio":
-                        audio_cond_config = cond_display_config.get("config", {})
-                        is_pre_encoded = audio_cond_config.get("pre_encoded", False)
-                        audio_inputs = torch.stack([cond[cond_id] for cond in demo_cond], dim=0)
-
-                        if is_pre_encoded:
-                            # Decode the pre-encoded audio conditioning
-                            audio_inputs = module.diffusion.pretransform.decode(audio_inputs)
-
-                        audio_inputs_out = rearrange(audio_inputs, 'b d n -> d (b n)')
-                        filename = f'demo_{cond_id}_{trainer.global_step:08}.wav'
-                        audio_inputs_out = audio_inputs_out.to(torch.float32).div(torch.max(torch.abs(audio_inputs_out))).mul(32767).to(torch.int16).cpu()
-                        torchaudio.save(filename, audio_inputs_out, self.sample_rate)
-                        log_audio(trainer.logger, f'demo_{cond_id}', filename, self.sample_rate)
-                        log_image(trainer.logger, f"demo_{cond_id}_melspec_left", audio_spectrogram_image(audio_inputs_out))
-            
-            if module.inpainting_config is not None and module.enc_enc:
-                cond_inputs['enc_enc_mask'] = (1 - inpaint_mask)
-                cond_inputs['self_attention_block_mask'] = module.self_attention_block_mask
-
-            for cfg_scale in self.demo_cfg_scales:
-
-                print(f"Generating demo for cfg scale {cfg_scale}")
+                # Encode if not pre-encoded
+                if module.diffusion.pretransform is not None and not module.pre_encoded:
+                    with torch.cuda.amp.autocast():
+                        diffusion_input = module.diffusion.pretransform.encode(diffusion_input)
+                elif module.diffusion.pretransform is not None:
+                    if hasattr(module.diffusion.pretransform, "scale") and module.diffusion.pretransform.scale != 1.0:
+                        diffusion_input = diffusion_input / module.diffusion.pretransform.scale
 
                 with torch.cuda.amp.autocast():
-                    model = module.diffusion_ema.ema_model if module.diffusion_ema is not None else module.diffusion.model
+                    context_latents, rollout_latents = module.generate_demo_rollout(
+                        diffusion_input, conditioning, demo_steps=self.demo_steps
+                    )
 
-                    if module.diffusion_objective == "v":
-                        fakes = sample(model, noise, self.demo_steps, 0, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True, inpaint_masked_input=inpaint_masked_input if module.inpainting_config is not None else None, inpaint_mask=inpaint_mask if module.inpainting_config is not None else None)
-                    elif module.diffusion_objective == "rectified_flow":
-                        fakes = sample_discrete_euler(model, noise, self.demo_steps, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True, inpaint_masked_input=inpaint_masked_input if module.inpainting_config is not None else None, inpaint_mask=inpaint_mask if module.inpainting_config is not None else None)
-                    elif module.diffusion_objective == "rf_denoiser":
-                        logsnr = torch.linspace(-6, 2, self.demo_steps+1).to(module.device)
-                        sigmas = torch.sigmoid(-logsnr)
+                # Concatenate context + rollout in latent space, then decode together
+                full_latents = torch.cat([context_latents, rollout_latents], dim=-1)
 
-                        sigmas[0] = 1.0
-                        sigmas[-1] = 0.0
+                if module.diffusion.pretransform is not None:
+                    if hasattr(module.diffusion.pretransform, "scale") and module.diffusion.pretransform.scale != 1.0:
+                        full_latents = full_latents * module.diffusion.pretransform.scale
+                    full_audio = module.diffusion.pretransform.decode(full_latents)
+                else:
+                    full_audio = full_latents
 
-                        fakes = sample_flow_pingpong(model, noise, sigmas=sigmas, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True)
-                        
+                # Log the full context+rollout as one audio file
+                full_out = rearrange(full_audio, 'b d n -> d (b n)')
+                full_out = full_out.to(torch.float32)
+                full_out = full_out.div(torch.max(torch.abs(full_out)).clamp(min=1e-8)).cpu()
+                filename = f'demo_rollout_{trainer.global_step:08}.wav'
+                torchaudio.save(filename, full_out, self.sample_rate)
+                log_audio(trainer.logger, f'demo_rollout', filename, self.sample_rate)
+                log_image(trainer.logger, f'demo_rollout_melspec', audio_spectrogram_image(full_out.mul(32767).to(torch.int16)))
 
-                    if module.diffusion.pretransform is not None:
-                        fakes = module.diffusion.pretransform.decode(fakes)
+                del full_audio
 
-                # Put the demos together
-                fakes = rearrange(fakes, 'b d n -> d (b n)')
+            else:
+                # Standard single-chunk demo generation
+                if module.inpainting_config is not None:
 
-                filename = f'demo_cfg_{cfg_scale}_{trainer.global_step:08}.wav'
-                fakes_out = fakes.to(torch.float32)
-                # normalize
-                fakes_out = fakes_out.div(torch.max(torch.abs(fakes_out))).cpu()
-                torchaudio.save(filename, fakes_out, self.sample_rate)
-                log_audio(trainer.logger, f'demo_cfg_{cfg_scale}', filename, self.sample_rate)                
-                log_image(trainer.logger, f'demo_melspec_left_cfg_{cfg_scale}', audio_spectrogram_image(fakes_out.div(torch.max(torch.abs(fakes_out))).mul(32767).to(torch.int16)))
+                    padding_masks = torch.stack([md["padding_mask"][0] for md in demo_cond], dim=0).to(module.device) # Shape (batch_size, sequence_length)
+
+                    # Create a mask of random length for a random slice of the input
+                    inpaint_masked_input, inpaint_mask = random_inpaint_mask(batch[0][:self.num_demos], padding_masks=padding_masks, **module.inpaint_mask_kwargs, silence_mean=module.silence_mean, silence_scale=module.silence_scale)
+
+                    conditioning['inpaint_mask'] = [inpaint_mask]
+                    conditioning['inpaint_masked_input'] = [inpaint_masked_input]
+
+                cond_inputs = module.diffusion.get_conditioning_inputs(conditioning)
+
+                if self.display_audio_cond:
+                    audio_inputs = torch.cat([cond["audio"] for cond in demo_cond], dim=0)
+                    audio_inputs = rearrange(audio_inputs, 'b d n -> d (b n)')
+
+                    filename = f'demo_audio_cond_{trainer.global_step:08}.wav'
+                    audio_inputs = audio_inputs.to(torch.float32).div(torch.max(torch.abs(audio_inputs))).mul(32767).to(torch.int16).cpu()
+                    torchaudio.save(filename, audio_inputs, self.sample_rate)
+                    log_audio(trainer.logger, f'demo_audio_cond', filename, self.sample_rate)
+                    log_image(trainer.logger, f"demo_audio_cond_melspec_left", audio_spectrogram_image(audio_inputs))
+
+                # Pre-generation conditioning display
+                if self.cond_display_configs is not None:
+                    for cond_display_config in self.cond_display_configs:
+                        cond_id = cond_display_config.get("id", None)
+                        assert cond_id is not None, "cond_display_configs must have an 'id' field"
+
+                        cond_type = cond_display_config.get("type", None)
+                        assert cond_type is not None, "cond_display_configs must have a 'type' field"
+
+                        if cond_type == "audio":
+                            audio_cond_config = cond_display_config.get("config", {})
+                            is_pre_encoded = audio_cond_config.get("pre_encoded", False)
+                            audio_inputs = torch.stack([cond[cond_id] for cond in demo_cond], dim=0)
+
+                            if is_pre_encoded:
+                                # Decode the pre-encoded audio conditioning
+                                audio_inputs = module.diffusion.pretransform.decode(audio_inputs)
+
+                            audio_inputs_out = rearrange(audio_inputs, 'b d n -> d (b n)')
+                            filename = f'demo_{cond_id}_{trainer.global_step:08}.wav'
+                            audio_inputs_out = audio_inputs_out.to(torch.float32).div(torch.max(torch.abs(audio_inputs_out))).mul(32767).to(torch.int16).cpu()
+                            torchaudio.save(filename, audio_inputs_out, self.sample_rate)
+                            log_audio(trainer.logger, f'demo_{cond_id}', filename, self.sample_rate)
+                            log_image(trainer.logger, f"demo_{cond_id}_melspec_left", audio_spectrogram_image(audio_inputs_out))
+
+                if module.inpainting_config is not None and module.enc_enc:
+                    print('Using enc-enc masking for demo generation')
+                    cond_inputs['enc_enc_mask'] = (1 - inpaint_mask)
+                    cond_inputs['self_attention_block_mask'] = module.self_attention_block_mask
+
+                for cfg_scale in self.demo_cfg_scales:
+
+                    print(f"Generating demo for cfg scale {cfg_scale}")
+
+                    with torch.cuda.amp.autocast():
+                        model = module.diffusion_ema.ema_model if module.diffusion_ema is not None else module.diffusion.model
+
+                        if module.diffusion_objective == "v":
+                            fakes = sample(model, noise, self.demo_steps, 0, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True, inpaint_masked_input=inpaint_masked_input if module.inpainting_config is not None else None, inpaint_mask=inpaint_mask if module.inpainting_config is not None else None)
+                        elif module.diffusion_objective == "rectified_flow":
+                            fakes = sample_discrete_euler(model, noise, self.demo_steps, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True, inpaint_masked_input=inpaint_masked_input if module.inpainting_config is not None else None, inpaint_mask=inpaint_mask if module.inpainting_config is not None else None)
+                        elif module.diffusion_objective == "rf_denoiser":
+                            logsnr = torch.linspace(-6, 2, self.demo_steps+1).to(module.device)
+                            sigmas = torch.sigmoid(-logsnr)
+
+                            sigmas[0] = 1.0
+                            sigmas[-1] = 0.0
+
+                            fakes = sample_flow_pingpong(model, noise, sigmas=sigmas, **cond_inputs, cfg_scale=cfg_scale, dist_shift=module.diffusion.dist_shift, batch_cfg=True, inpaint_masked_input=inpaint_masked_input if module.inpainting_config is not None else None, inpaint_mask=inpaint_mask if module.inpainting_config is not None else None)
+
+
+                        if module.diffusion.pretransform is not None:
+                            fakes = module.diffusion.pretransform.decode(fakes)
+
+                    # Put the demos together
+                    fakes = rearrange(fakes, 'b d n -> d (b n)')
+
+                    filename = f'demo_cfg_{cfg_scale}_{trainer.global_step:08}.wav'
+                    fakes_out = fakes.to(torch.float32)
+                    # normalize
+                    fakes_out = fakes_out.div(torch.max(torch.abs(fakes_out))).cpu()
+                    torchaudio.save(filename, fakes_out, self.sample_rate)
+                    log_audio(trainer.logger, f'demo_cfg_{cfg_scale}', filename, self.sample_rate)
+                    log_image(trainer.logger, f'demo_melspec_left_cfg_{cfg_scale}', audio_spectrogram_image(fakes_out.div(torch.max(torch.abs(fakes_out))).mul(32767).to(torch.int16)))
             
                 # Mid-generation conditioning display
                 if self.cond_display_configs is not None:
@@ -880,7 +926,7 @@ class DiffusionCondDemoCallback(pl.Callback):
                             torchaudio.save(filename, audio_mix_out, self.sample_rate)
                             log_audio(trainer.logger, f'demo_{cond_id}_mix_cfg_{cfg_scale}', filename, self.sample_rate)
 
-            del fakes
+                del fakes
 
         except Exception as e:
             raise e

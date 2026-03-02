@@ -193,8 +193,6 @@ def generate_diffusion_cond(
     if use_kv_cache:
         kv_cache = {
             'initialized': False,
-            'self_attn': {},
-            'cross_attn': {}
         }
         conditioning_inputs['use_kv_cache'] = True
         conditioning_inputs['kv_cache'] = kv_cache
@@ -391,8 +389,6 @@ def generate_diffusion_cond_inpaint(
     if use_kv_cache:
         kv_cache = {
             'initialized': False,
-            'self_attn': {},
-            'cross_attn': {}
         }
         conditioning_inputs['use_kv_cache'] = True
         conditioning_inputs['kv_cache'] = kv_cache
@@ -613,10 +609,10 @@ def generate_diffusion_cond_blockar(
         # Initialize KV cache if enabled (reset for each block)
         kv_cache = None
         if use_kv_cache:
+            # Clear per-module caches from previous block
+            model.model.model.transformer.clear_kv_cache()
             kv_cache = {
                 'initialized': False,
-                'self_attn': {},
-                'cross_attn': {}
             }
             conditioning_inputs['use_kv_cache'] = True
             conditioning_inputs['kv_cache'] = kv_cache

@@ -72,6 +72,12 @@ def main():
 
     if args.pretrained_ckpt_path:
         copy_state_dict(model, load_ckpt_state_dict(args.pretrained_ckpt_path))
+    if model_config.get("training", {}).get("arc", {}).get("self_forcing", {}).get("use_kv_cache", False):
+        # need to run the split qkv matrices before instantiating the optimizer to avoid compilation errors
+        # loop through all submodule of model.model.model.transformer, and for the ones that are Attention, run _split_qkv_projections_for_cache()
+        for submodule in model.model.model.transformer.modules():
+            if hasattr(submodule, "_split_qkv_projections_for_cache"):
+                submodule._split_qkv_projections_for_cache()
 
     if args.remove_pretransform_weight_norm == "pre_load":
         remove_weight_norm_from_model(model.pretransform)

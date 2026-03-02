@@ -387,6 +387,21 @@ class Attention(nn.Module):
         if causal:
             print('Using `causal` argument disables FlexAttention. If you want to use them together, incorporate causal masking into `flex_attention_block_mask`.')
 
+        # Per-module KV cache (avoids dict mutation inside compiled code)
+        self._cache_k = None
+        self._cache_v = None
+
+    def set_cache(self, k, v):
+        self._cache_k = k
+        self._cache_v = v
+
+    def clear_cache(self):
+        self._cache_k = None
+        self._cache_v = None
+
+    def has_cache(self):
+        return self._cache_k is not None
+
     def _split_qkv_projections_for_cache(self):
         """
         Split fused to_qkv projection into separate to_q and to_kv for KV caching.
@@ -555,23 +570,19 @@ class Attention(nn.Module):
         flex_attention_score_mod = None,
         flash_attn_sliding_window = None,
         use_kv_cache = False,
-        kv_cache = None,
-        cache_key = None,
+        cache_initialized = False,
         encoder_seq_len = None
     ):
         h, kv_h, has_context = self.num_heads, self.kv_heads, context is not None
 
         kv_input = context if has_context else x
 
-        # Determine if we're using KV caching
-        using_cache = use_kv_cache and kv_cache is not None and cache_key is not None
-        cache_initialized = using_cache and kv_cache.get('initialized', False)
+        using_cache = use_kv_cache
         is_cross_attn = has_context
 
         # Split fused projection if using cache for first time
         if using_cache and not cache_initialized and not is_cross_attn:
             if not hasattr(self, 'to_q') and hasattr(self, 'to_qkv'):
-                # print(f"Initializing KV cache for first time, splitting fused to_qkv projection for {cache_key}")
                 self._split_qkv_projections_for_cache()
 
         # Compute Q,K,V with caching support
@@ -579,20 +590,16 @@ class Attention(nn.Module):
             # Cache is initialized - reuse cached K,V where possible
             if is_cross_attn:
                 # Cross-attention: reuse entire cached K,V (text conditioning is constant)
-                attn_type = 'cross_attn'
-                k = kv_cache[attn_type][cache_key]['k']
-                v = kv_cache[attn_type][cache_key]['v']
+                k = self._cache_k
+                v = self._cache_v
                 # Always compute Q (needed for every forward pass)
                 q = self.to_q(x)
                 q = rearrange(q, 'b n (h d) -> b h n d', h = h)
             else:
                 # Self-attention: reuse encoder K,V, compute decoder K,V
                 # Note: x is already sliced to decoder-only when cache is initialized
-                attn_type = 'self_attn'
-
-                # Get cached encoder portion
-                k_encoder = kv_cache[attn_type][cache_key]['k']
-                v_encoder = kv_cache[attn_type][cache_key]['v']
+                k_encoder = self._cache_k
+                v_encoder = self._cache_v
 
                 # Compute Q and K,V for decoder (x is already decoder-only)
                 q = self.to_q(x)
@@ -614,14 +621,36 @@ class Attention(nn.Module):
             else:
                 q, k, v = self.to_qkv(x).chunk(3, dim=-1)
                 q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
-                # print(k[:, :, 1:208].mean(), v[:, :, 1:208].mean())
 
         # Normalize q and k for cosine sim attention
-        if self.qk_norm == "l2":
-            q = F.normalize(q, dim=-1)
-            k = F.normalize(k, dim=-1)
-        elif self.qk_norm != "none":
-            q, k = self.apply_qk_layernorm(q, k)
+        # Cached K,V already have normalization baked in from the first pass,
+        # so we must avoid re-normalizing them.
+        if using_cache and cache_initialized:
+            if is_cross_attn:
+                # Cross-attention: entire K is from cache (already normalized).
+                # Only normalize Q.
+                if self.qk_norm == "l2":
+                    q = F.normalize(q, dim=-1)
+                elif self.qk_norm != "none":
+                    q = self.q_norm(q).to(q.dtype)
+            else:
+                # Self-attention: encoder K is from cache (already normalized),
+                # decoder K is fresh and needs normalization.
+                if self.qk_norm == "l2":
+                    q = F.normalize(q, dim=-1)
+                    k_decoder = k[:, :, encoder_seq_len:]
+                    k_decoder = F.normalize(k_decoder, dim=-1)
+                    k = torch.cat([k[:, :, :encoder_seq_len], k_decoder], dim=2)
+                elif self.qk_norm != "none":
+                    k_decoder = k[:, :, encoder_seq_len:]
+                    q, k_decoder = self.apply_qk_layernorm(q, k_decoder)
+                    k = torch.cat([k[:, :, :encoder_seq_len], k_decoder], dim=2)
+        else:
+            if self.qk_norm == "l2":
+                q = F.normalize(q, dim=-1)
+                k = F.normalize(k, dim=-1)
+            elif self.qk_norm != "none":
+                q, k = self.apply_qk_layernorm(q, k)
 
         if rotary_pos_emb is not None:
             freqs, _ = rotary_pos_emb
@@ -639,11 +668,10 @@ class Attention(nn.Module):
             else:
                 ratio = k.shape[-2] / q.shape[-2]
                 q_freqs, k_freqs = ratio * freqs, freqs
-            # print(q_freqs.shape, k_freqs.shape, q.shape)
 
             # Special handling for cached self-attention with encoder/decoder split
             if using_cache and cache_initialized and not is_cross_attn:
-                cached_encoder_seq_len = kv_cache['encoder_seq_len']
+                cached_encoder_seq_len = encoder_seq_len
 
                 # Q is decoder-only and needs RoPE with position offset
                 q_freqs_decoder = q_freqs[cached_encoder_seq_len:]
@@ -661,32 +689,19 @@ class Attention(nn.Module):
                 # Normal path: apply RoPE to full sequences
                 q = apply_rotary_pos_emb(q, q_freqs)
                 k = apply_rotary_pos_emb(k, k_freqs)
-                
 
             q = q.to(v.dtype)
             k = k.to(v.dtype)
 
         # Populate cache on first pass (after RoPE has been applied)
-        if using_cache and not cache_initialized:
+        if using_cache and not self.has_cache():
             if is_cross_attn:
                 # Cache entire cross-attention K,V
-                attn_type = 'cross_attn'
-                if attn_type not in kv_cache:
-                    kv_cache[attn_type] = {}
-                kv_cache[attn_type][cache_key] = {
-                    'k': k.detach(),
-                    'v': v.detach()
-                }
+                self.set_cache(k, v)
             else:
                 # Cache encoder portion of self-attention K,V
-                attn_type = 'self_attn'
-                if attn_type not in kv_cache:
-                    kv_cache[attn_type] = {}
                 if encoder_seq_len is not None and encoder_seq_len > 0:
-                    kv_cache[attn_type][cache_key] = {
-                        'k': k[:, :, :encoder_seq_len].detach(),
-                        'v': v[:, :, :encoder_seq_len].detach()
-                    }
+                    self.set_cache(k[:, :, :encoder_seq_len], v[:, :, :encoder_seq_len])
 
         n, device = q.shape[-2], q.device
 
@@ -844,29 +859,28 @@ class TransformerBlock(nn.Module):
         self_attention_flash_sliding_window = None,
         cross_attention_flash_sliding_window = None,
         use_kv_cache = False,
-        kv_cache = None,
-        layer_ix = None,
+        cache_initialized = False,
         encoder_seq_len = None
     ):
         if rotary_pos_emb is None and self.add_rope:
             rotary_pos_emb = self.rope.forward_from_seq_len(x.shape[-2])
 
         if self.global_cond_dim is not None and self.global_cond_dim > 0 and global_cond is not None:
-            
+
             scale_self, shift_self, gate_self, scale_ff, shift_ff, gate_ff = (self.to_scale_shift_gate + global_cond).unsqueeze(1).chunk(6, dim=-1)
 
             # self-attention with adaLN
             residual = x
             x = self.pre_norm(x)
             x = x * (1 + scale_self) + shift_self
-            x = self.self_attn(x, rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, cache_key = layer_ix, encoder_seq_len = encoder_seq_len)
+            x = self.self_attn(x, rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window, use_kv_cache = use_kv_cache, cache_initialized = cache_initialized, encoder_seq_len = encoder_seq_len)
             x = x * torch.sigmoid(1 - gate_self)
             x = self.self_attn_scale(x)
             x = x + residual
 
             if context is not None and self.cross_attend:
-                x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, cache_key = layer_ix))
-            
+                x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window, use_kv_cache = use_kv_cache, cache_initialized = cache_initialized))
+
             if self.conformer is not None:
                 x = x + self.conformer_scale(self.conformer(x))
 
@@ -880,11 +894,11 @@ class TransformerBlock(nn.Module):
             x = x + residual
 
         else:
-            x = x + self.self_attn_scale(self.self_attn(self.pre_norm(x), rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, cache_key = layer_ix, encoder_seq_len = encoder_seq_len))
+            x = x + self.self_attn_scale(self.self_attn(self.pre_norm(x), rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window, use_kv_cache = use_kv_cache, cache_initialized = cache_initialized, encoder_seq_len = encoder_seq_len))
 
             if context is not None and self.cross_attend:
-                x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, cache_key = layer_ix))
-                    
+                x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window, use_kv_cache = use_kv_cache, cache_initialized = cache_initialized))
+
             if self.conformer is not None:
                 x = x + self.conformer_scale(self.conformer(x))
 
@@ -972,13 +986,20 @@ class ContinuousTransformer(nn.Module):
                 )
             )
         
+    def clear_kv_cache(self):
+        """Clear KV caches stored on all attention modules."""
+        for layer in self.layers:
+            layer.self_attn.clear_cache()
+            if hasattr(layer, 'cross_attn') and layer.cross_attn is not None:
+                layer.cross_attn.clear_cache()
+
     def forward(
         self,
         x,
         prepend_embeds = None,
         global_cond = None,
         return_info = False,
-        use_checkpointing = True,
+        use_checkpointing = False,
         exit_layer_ix = None,
         input_add_emb = None,
         enc_enc_mask = None,
@@ -990,7 +1011,7 @@ class ContinuousTransformer(nn.Module):
     ):
         batch, seq, device = *x.shape[:2], x.device
 
-        use_checkpointing = os.environ.get('USE_CHECKPOINTING', '1') == '1' and use_checkpointing
+        use_checkpointing = os.environ.get('USE_CHECKPOINTING', '1') == '1' or use_checkpointing
 
         model_dtype = next(self.parameters()).dtype
         x = x.to(model_dtype)
@@ -1028,7 +1049,7 @@ class ContinuousTransformer(nn.Module):
             if postpend:
                 # If postpending, we need to shift the RoPE frequencies such that the prepend_cond tokens (which are now at the end of the sequence) get the correct RoPE frequencies
                 # since they are expecting to be at the beginning of the sequence. This is done by rolling the RoPE frequencies by the length of the postpended tokens.
-                rolled_freqs_0 = torch.roll(rotary_pos_emb[0], shifts=-prepend_length, dims=0)
+                rolled_freqs_0 = torch.roll(rotary_pos_emb[0], shifts=-1, dims=0) # TODO
                 rotary_pos_emb = (rolled_freqs_0, rotary_pos_emb[1])
 
         else:
@@ -1044,29 +1065,25 @@ class ContinuousTransformer(nn.Module):
         encoder_seq_len = None
         if use_kv_cache and kv_cache is not None:
             if 'encoder_seq_len' in kv_cache:
-                # Already set (e.g., by prefill or by dit.py before calling transformer)
                 encoder_seq_len = kv_cache['encoder_seq_len']
             elif enc_enc_mask is not None:
-                # Compute from enc_enc_mask: 0 = encoder (zeroed out), 1 = decoder
-                # enc_enc_mask shape before transpose: (batch, 1, seq)
                 encoder_seq_len = 208 #TODO: hardcoded for now, but could be computed from enc_enc_mask if needed
 
         # Initialize KV cache structure on first use
+        cache_initialized = False
         if use_kv_cache and kv_cache is not None:
+            cache_initialized = kv_cache.get('initialized', False)
             if not kv_cache.get('initialized', False):
-                kv_cache['self_attn'] = {}
-                kv_cache['cross_attn'] = {}
                 if 'encoder_seq_len' not in kv_cache:
-                    kv_cache['encoder_seq_len'] = encoder_seq_len
-
-
+                    kv_cache['encoder_seq_len'] = 208
+            
         # Iterate over the transformer layers
         for layer_ix, layer in enumerate(self.layers):
 
             if use_checkpointing:
-                x = checkpoint(layer, x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, self_attention_flash_sliding_window = self.sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, layer_ix = layer_ix, encoder_seq_len = encoder_seq_len, **kwargs)
+                x = checkpoint(layer, x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, self_attention_flash_sliding_window = self.sliding_window, use_kv_cache = use_kv_cache, cache_initialized = cache_initialized, encoder_seq_len = encoder_seq_len, **kwargs)
             else:
-                x = layer(x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, self_attention_flash_sliding_window = self.sliding_window, use_kv_cache = use_kv_cache, kv_cache = kv_cache, layer_ix = layer_ix, encoder_seq_len = encoder_seq_len, **kwargs)
+                x = layer(x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, self_attention_flash_sliding_window = self.sliding_window, use_kv_cache = use_kv_cache, cache_initialized = cache_initialized, encoder_seq_len = encoder_seq_len, **kwargs)
 
             if return_info:
                 info["hidden_states"].append(x)

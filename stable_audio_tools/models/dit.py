@@ -29,6 +29,7 @@ class DiffusionTransformer(nn.Module):
         timestep_embed_dim=None,
         diffusion_objective: tp.Literal["v", "rectified_flow", "rf_denoiser"] = "v",
         postpend=False,
+        split_qkv=False,
         **kwargs):
 
         super().__init__()
@@ -137,6 +138,10 @@ class DiffusionTransformer(nn.Module):
         self.postprocess_conv = nn.Conv1d(io_channels, io_channels, 1, bias=False)
         nn.init.zeros_(self.postprocess_conv.weight)
 
+        if split_qkv:
+            for block in self.transformer.layers:
+                block.self_attn._split_qkv_projections_for_cache()
+
     def _forward(
         self,
         x,
@@ -232,12 +237,8 @@ class DiffusionTransformer(nn.Module):
         # Prefill: if KV cache exists but not yet initialized, run encoder-only pass to populate it.
         # This lets all N denoising steps use fast decoder-only flash attention instead of flex attention.
         if use_kv_cache and kv_cache is not None and not kv_cache.get('initialized', False) and prefill:
-            enc_seq_len_prefill = kv_cache.get('encoder_seq_len')
-            if enc_seq_len_prefill is None and enc_enc_mask is not None:
-                # raw_len = int((enc_enc_mask[0, 0, :] == 0).sum().item())
-                # enc_seq_len_prefill = raw_len // self.patch_size
-                kv_cache['encoder_seq_len'] = 208 #TODO hardcoded for now, need to figure out a good way to determine this dynamically based on the enc_enc_mask or input length but not trigger graph recompilation
-
+            enc_seq_len_prefill = 208
+            kv_cache['encoder_seq_len'] = 208 #TODO hardcoded for now, need to figure out a good way to determine this dynamically based on the enc_enc_mask or input length but not trigger graph recompilation
             if enc_seq_len_prefill is not None and enc_seq_len_prefill > 0:
                 x_enc = x[:, :enc_seq_len_prefill]
                 add_emb_enc = add_emb[:, :enc_seq_len_prefill] if add_emb is not None else None
@@ -246,7 +247,7 @@ class DiffusionTransformer(nn.Module):
                     kwargs.pop('self_attention_block_mask') # this should turn off flex attention
                 enc_out = self.transformer(
                     x_enc,
-                    prepend_embeds=prepend_inputs,
+                    # prepend_embeds=prepend_inputs,
                     context=cross_attn_cond,
                     return_info=False,
                     input_add_emb=add_emb_enc,
@@ -258,10 +259,11 @@ class DiffusionTransformer(nn.Module):
                     **kwargs,
                 )
                 # Run encoder output through the same post-processing pipeline, then cache it
-                if not postpend:
-                    enc_out = rearrange(enc_out, "b t c -> b c t")[:, :, prepend_length:]
-                else:
-                    enc_out = rearrange(enc_out, "b t c -> b c t")[:, :, :-prepend_length] if prepend_length > 0 else rearrange(enc_out, "b t c -> b c t")
+                enc_out = rearrange(enc_out, "b t c -> b c t")
+                # if not postpend:
+                #     enc_out = enc_out[:, :, prepend_length:]
+                # else:
+                #     enc_out = enc_out[:, :, :-prepend_length] if prepend_length > 0 else rearrange(enc_out, "b t c -> b c t")
                 if self.patch_size > 1:
                     enc_out = rearrange(enc_out, "b (c p) t -> b c (t p)", p=self.patch_size)
                 enc_out = self.postprocess_conv(enc_out) + enc_out
@@ -325,6 +327,7 @@ class DiffusionTransformer(nn.Module):
                 kv_cache['initialized'] = True
             elif 'encoder_output' in kv_cache:
                 # Subsequent passes: prepend cached encoder output to decoder output
+                kv_cache['initialized'] = True
                 encoder_output = kv_cache['encoder_output']
                 output = torch.cat([encoder_output, output], dim=-1)
 
