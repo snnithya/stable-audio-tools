@@ -776,7 +776,9 @@ class DiffusionCondDemoCallback(pl.Callback):
                 log_audio(trainer.logger, f'demo_rollout', filename, self.sample_rate)
                 log_image(trainer.logger, f'demo_rollout_melspec', audio_spectrogram_image(full_out.mul(32767).to(torch.int16)))
 
-                del full_audio
+                del context_latents, rollout_latents, full_latents, full_audio, full_out, diffusion_input
+                torch.cuda.empty_cache()
+                gc.collect()
 
             else:
                 # Standard single-chunk demo generation

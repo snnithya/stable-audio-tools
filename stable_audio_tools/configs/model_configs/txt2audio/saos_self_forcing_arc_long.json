@@ -111,7 +111,8 @@
         "arc": {
             "self_forcing": {
                 "max_sampling_steps": 6,
-                "n_rollout_chunks": 4,
+                "n_rollout_chunks": 14,
+                "use_silence_shift": true,
                 "chunk_size": 47,
                 "context_size": 208,
                 "use_kv_cache": true,
@@ -127,12 +128,12 @@
                 "generator": "logsnr_uniform",
                 "discriminator": "logit_normal"
             },
-            "use_model_as_discriminator": true,
+            "use_model_as_discriminator": false,
             "discriminator_base_ckpt": "/home/zachary/.cache/huggingface/hub/models--stabilityai--stable-audio-open-small/snapshots/dc620d91535857b72ebb59b4ca45978db6d417f5/base_model.ckpt",
             "discriminator_base_model": "/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/model_configs/txt2audio/saos_base.json",
             "discriminator": {
                 "type": "convnext",
-                "dit_hidden_layer": 12,
+                "dit_hidden_layer": 8,
                 "weights": {
                     "generator": 1.0,
                     "discriminator": 1.0

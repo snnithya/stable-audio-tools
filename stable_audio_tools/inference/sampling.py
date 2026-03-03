@@ -183,7 +183,7 @@ def sample_rk4(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, di
     return x
 
 @torch.no_grad()
-def sample_flow_dpmpp(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, dist_shift=None, disable_tqdm=True, **extra_args):
+def sample_flow_dpmpp(model, x, steps=None, sigma_max=1, sigmas=None, callback=None, dist_shift=None, disable_tqdm=True,  inpaint_masked_input=None, inpaint_mask=None, **extra_args):
     """Draws samples from a model given starting noise. DPM-Solver++ for RF models"""
 
     assert steps is not None or sigmas is not None, "Either steps or sigmas must be provided"
@@ -208,6 +208,11 @@ def sample_flow_dpmpp(model, x, steps=None, sigma_max=1, sigmas=None, callback=N
 
     for i in trange(len(t) - 1, disable=disable_tqdm):
 
+        if inpaint_mask is not None and inpaint_masked_input is not None:
+            # add noise to the masked input according to the current sigma
+            noised_masked_input = inpaint_masked_input * (1 - t[i]) + torch.randn_like(x) * t[i]
+            x = x * (1 - inpaint_mask) + noised_masked_input * inpaint_mask
+
         t_curr, t_next = t[i], t[i + 1]
 
         denoised = x - t_curr * model(x, t_curr * ts, **extra_args)
@@ -223,6 +228,9 @@ def sample_flow_dpmpp(model, x, steps=None, sigma_max=1, sigmas=None, callback=N
             denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
             x = (t_next / t_curr) * x - alpha_t * (-h).expm1() * denoised_d
         old_denoised = denoised
+
+    if inpaint_mask is not None and inpaint_masked_input is not None:
+        x = x * (1 - inpaint_mask) + inpaint_masked_input * inpaint_mask
     return x
 
 @torch.no_grad()

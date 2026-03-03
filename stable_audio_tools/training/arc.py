@@ -1,3 +1,4 @@
+import gc
 import pytorch_lightning as pl
 import random
 import torch
@@ -6,6 +7,7 @@ import typing as tp
 from ema_pytorch import EMA
 from torch.nn import functional as F
 from torch.nn.attention.flex_attention import create_block_mask, or_masks
+import torch.distributed as dist
 
 from ..inference.sampling import truncated_logistic_normal_rescaled
 from ..models.diffusion import ConditionedDiffusionModelWrapper
@@ -591,6 +593,7 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
 
         # Outpainting dropout probs for initial context
         self.outpainting_dropout_probs = self_forcing_config.get('outpainting_dropout_probs', None)
+        self.use_silence_shift = self_forcing_config.get('use_silence_shift', True)
 
         # Build noise schedule once: logsnr linspace [-6, 2] -> t = sigmoid(-logsnr)
         logsnr = torch.linspace(-6, 2, self.max_sampling_steps + 1)
@@ -641,17 +644,23 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
         print(self.self_attention_block_mask.to_string())
         return self.self_attention_block_mask
 
-    def _apply_silence_shift(self, diffusion_input):
+    def _apply_silence_dropout(self, diffusion_input):
         """
-        Apply silence dropout by prepending silence and shifting the sequence right,
-        truncating from the end. This ensures that audio after the silence context
-        is always the true start of the song, not mid-song audio.
+        Apply silence dropout to the context region of diffusion_input.
+
+        When use_silence_shift=True (default): prepends silence and shifts the
+        entire sequence right, truncating from the end. This ensures audio after
+        the silence context is the true start of the song, not mid-song audio.
+
+        When use_silence_shift=False: replaces the start of the context region
+        with silence in-place (naive mode), leaving the rest of the sequence
+        at its original position.
 
         Args:
             diffusion_input: (B, C, total_len) full latent sequence
 
         Returns:
-            shifted_input: (B, C, total_len) shifted sequence (silence prepended, truncated from end)
+            result: (B, C, total_len) modified sequence
         """
         if self.outpainting_dropout_probs is None:
             return diffusion_input.clone()
@@ -662,7 +671,7 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
         p_uncond = self.outpainting_dropout_probs.get('p_uncond', 0.0)
         p_partial = self.outpainting_dropout_probs.get('p_partial', 0.0)
 
-        shifted_input = diffusion_input.clone()
+        result = diffusion_input.clone()
 
         # Ensure silence tensors are on the right device
         if self.silence_mean is not None and self.silence_mean.device != device:
@@ -672,26 +681,47 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
         for i in range(B):
             rand_val = random.random()
             if rand_val < p_uncond:
-                shift = self.context_size
+                drop_length = self.context_size
             elif rand_val < p_uncond + p_partial and self.context_size > self.chunk_size:
                 num_chunks = self.context_size // self.chunk_size
                 chunks_to_drop = random.randint(1, num_chunks)
-                shift = chunks_to_drop * self.chunk_size
+                drop_length = chunks_to_drop * self.chunk_size
             else:
-                shift = 0
+                drop_length = 0
 
-            if shift > 0:
-                # Sample silence for the prefix
+            if drop_length > 0:
+                # Sample silence latents
                 if self.silence_mean is not None and self.silence_scale is not None:
-                    silence = self.silence_mean[..., :shift] + self.silence_scale[..., :shift] * torch.randn_like(shifted_input[i, :, :shift])
+                    silence = self.silence_mean[..., :drop_length] + self.silence_scale[..., :drop_length] * torch.randn_like(result[i, :, :drop_length])
+                    silence = silence[0]  # squeeze leading dim from silence tensors
                 else:
-                    silence = torch.zeros_like(shifted_input[i, :, :shift])
+                    silence = torch.zeros_like(result[i, :, :drop_length])
 
-                # Shift right: [silence | original_from_0...(total-shift)]
-                # print(silence.shape, diffusion_input[i, :, :total_len - shift].shape)
-                shifted_input[i] = torch.cat([silence[0], diffusion_input[i, :, :total_len - shift]], dim=-1)
+                if self.use_silence_shift:
+                    # Shift right: [silence | original_from_0...(total-drop_length)]
+                    result[i] = torch.cat([silence, diffusion_input[i, :, :total_len - drop_length]], dim=-1)
+                else:
+                    # Naive: replace the start of the sequence with silence in-place
+                    result[i, :, :drop_length] = silence
 
-        return shifted_input
+        return result
+
+    def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        if rank == 0:
+            # Generate random indices
+            indices = torch.randint(
+                low=0,
+                high=num_denoising_steps,
+                size=(num_blocks,),
+                device=device
+            )
+        else:
+            indices = torch.empty(num_blocks, dtype=torch.long, device=device)
+
+        dist.broadcast(indices, src=0)  # Broadcast the random indices to all ranks
+        return indices.tolist()
 
     def generate_rollout(self, diffusion_input, conditioning, padding_masks):
         """
@@ -711,7 +741,7 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
         device = diffusion_input.device
 
         # Apply silence dropout via prepend-and-shift
-        shifted_input = self._apply_silence_shift(diffusion_input)
+        shifted_input = self._apply_silence_dropout(diffusion_input)
 
         # Extract context from the shifted input
         context = shifted_input[:, :, :self.context_size].clone()
@@ -732,9 +762,12 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
 
         rollout_chunks = []
 
+        # pregenerate all k's to make it sync across gpus
+        k_list = self.generate_and_sync_list(self.n_rollout_chunks, self.max_sampling_steps, device)
+
         for chunk_idx in range(self.n_rollout_chunks):
             # Sample number of steps for this chunk
-            k = random.randint(1, self.max_sampling_steps)
+            k = k_list[chunk_idx]
 
             # Fresh noise for the full window
             x = torch.randn(B, C, self.window_size, device=device, dtype=diffusion_input.dtype)
@@ -807,6 +840,10 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
                 torch.zeros(B, C, self.chunk_size, device=device, dtype=diffusion_input.dtype)
             ], dim=2)
 
+        # Clear KV cache after rollout to free GPU memory
+        if self.use_kv_cache:
+            self.diffusion.model.model.transformer.clear_kv_cache()
+
         # Concatenate context + generated chunks for the full student sequence
         full_student = torch.cat([context, torch.cat(rollout_chunks, dim=2)], dim=2)
         return full_student, shifted_input
@@ -843,7 +880,7 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
         t_schedule[-1] = 0.0
 
         # Apply silence dropout via prepend-and-shift (same as training)
-        shifted_input = self._apply_silence_shift(diffusion_input)
+        shifted_input = self._apply_silence_dropout(diffusion_input)
 
         # Extract context from the shifted input
         context = shifted_input[:, :, :self.context_size].clone()
@@ -917,6 +954,10 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
                 torch.zeros(B, C, self.chunk_size, device=device, dtype=diffusion_input.dtype)
             ], dim=2)
 
+        # Clear KV cache after rollout to free GPU memory
+        if self.use_kv_cache:
+            self.diffusion.model.model.transformer.clear_kv_cache()
+
         rollout = torch.cat(rollout_chunks, dim=2)
         return context, rollout
 
@@ -970,6 +1011,11 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
                 denoised_student, real_rollout = self.generate_rollout(diffusion_input, conditioning, padding_masks)
                 denoised_student = denoised_student.detach()
 
+        # Clear inpainting tensors added to conditioning dict during rollout to free GPU memory
+        conditioning.pop('inpaint_mask', None)
+        conditioning.pop('inpaint_masked_input', None)
+        del conditioning
+
         if train_gen:
             log_dict['train/gen_lr'] = opt_gen.param_groups[0]['lr']
 
@@ -982,14 +1028,14 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
             x_t_gan = denoised_student * (1 - t_gan)[:, None, None] + noise * t_gan[:, None, None]
 
             disc_conditioning = self.discriminator.conditioner(metadata, self.device)
-
+        # with torch.compiler.disable():
             v_t_gan_hidden_states = self.discriminator(
                 x_t_gan, t_gan, cond=disc_conditioning,
-                cfg_scale=1.0, use_checkpointing=True,
+                cfg_scale=1.0, use_checkpointing=False,
                 exit_layer_ix=self.discriminator_dit_layer
             )
             # truncate to the rollout region for scoring
-            # v_t_gan_hidden_states = v_t_gan_hidden_states[:, self.context_size:, :]
+            v_t_gan_hidden_states = v_t_gan_hidden_states[:, self.context_size:, :]
             disc_scores = self.discriminator_head(v_t_gan_hidden_states.transpose(1, 2))
 
             log_dict['gen_disc_scores_mean'] = disc_scores.mean().detach()
@@ -999,10 +1045,10 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
             x_t_gan_real = real_rollout * (1 - t_gan)[:, None, None] + noise * t_gan[:, None, None]
             v_t_gan_real_hidden_states = self.discriminator(
                 x_t_gan_real, t_gan, cond=disc_conditioning,
-                cfg_scale=1.0, use_checkpointing=True,
+                cfg_scale=1.0, use_checkpointing=False,
                 exit_layer_ix=self.discriminator_dit_layer
             )
-            # v_t_gan_real_hidden_states = v_t_gan_real_hidden_states[:, self.context_size:, :]
+            v_t_gan_real_hidden_states = v_t_gan_real_hidden_states[:, self.context_size:, :]
             disc_scores_real = self.discriminator_head(v_t_gan_real_hidden_states.transpose(1, 2))
 
             diff = disc_scores_real - disc_scores
@@ -1024,27 +1070,27 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
 
         else:
             # Discriminator training step
-            denoised_student = denoised_student.detach().requires_grad_(True)
+            denoised_student = denoised_student.detach()
             t_gan = self.dis_noise_dist(reals.shape[0])
             noise = torch.randn_like(denoised_student)
             reals_t_gan = real_rollout * (1 - t_gan)[..., None, None] + noise * t_gan[..., None, None]
             denoised_t_gan = denoised_student * (1 - t_gan)[..., None, None] + noise * t_gan[..., None, None]
 
-            reals_t_gan = reals_t_gan.detach().requires_grad_(True)
-            denoised_t_gan = denoised_t_gan.detach().requires_grad_(True)
+            reals_t_gan = reals_t_gan.detach()
+            denoised_t_gan = denoised_t_gan.detach()
 
             disc_conditioning = self.discriminator.conditioner(metadata, self.device)
-
+            # with torch.compiler.disable():
             reals_gan_hidden_states = self.discriminator(
-                 reals_t_gan, t_gan, cond=disc_conditioning,
-                cfg_scale=1.0, exit_layer_ix=self.discriminator_dit_layer, use_checkpointing=True,
+                reals_t_gan, t_gan, cond=disc_conditioning,
+                cfg_scale=1.0, exit_layer_ix=self.discriminator_dit_layer, use_checkpointing=False,
             ).transpose(1, 2)
-            # reals_gan_hidden_states = reals_gan_hidden_states[:, :,  self.context_size:]
+            reals_gan_hidden_states = reals_gan_hidden_states[:, :,  self.context_size:]
             denoised_gan_hidden_states = self.discriminator(
                 denoised_t_gan, t_gan, cond=disc_conditioning,
-                cfg_scale=1.0, exit_layer_ix=self.discriminator_dit_layer, use_checkpointing=True,
+                cfg_scale=1.0, exit_layer_ix=self.discriminator_dit_layer, use_checkpointing=False,
             ).transpose(1, 2)
-            # denoised_gan_hidden_states = denoised_gan_hidden_states[:, :,  self.context_size:]
+            denoised_gan_hidden_states = denoised_gan_hidden_states[:, :,  self.context_size:]
             disc_scores_reals = checkpoint(self.discriminator_head, reals_gan_hidden_states)
             disc_scores_denoised = checkpoint(self.discriminator_head, denoised_gan_hidden_states)
 
@@ -1054,11 +1100,11 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
                 noised_denoised_t_gan = denoised_t_gan + r1_approx_variance * torch.randn_like(denoised_t_gan)
                 noised_reals_gan_hidden_states = self.discriminator(
                     noised_reals_t_gan, t_gan, cond=disc_conditioning,
-                    cfg_scale=1.0, exit_layer_ix=self.discriminator_dit_layer, use_checkpointing=True
+                    cfg_scale=1.0, exit_layer_ix=self.discriminator_dit_layer, use_checkpointing=False
                 ).transpose(1, 2)
                 noised_denoised_gan_hidden_states = self.discriminator(
                     noised_denoised_t_gan, t_gan, cond=disc_conditioning,
-                    cfg_scale=1.0, exit_layer_ix=self.discriminator_dit_layer, use_checkpointing=True
+                    cfg_scale=1.0, exit_layer_ix=self.discriminator_dit_layer, use_checkpointing=False
                 ).transpose(1, 2)
                 disc_scores_noised_reals = checkpoint(self.discriminator_head, noised_reals_gan_hidden_states)
                 disc_scores_noised_denoised = checkpoint(self.discriminator_head, noised_denoised_gan_hidden_states)
@@ -1089,12 +1135,12 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
                         rolled_metadata[i][rolled_key] = metadata[(i + 1) % reals.shape[0]][rolled_key]
 
                 rolled_conditioning = self.discriminator.conditioner(rolled_metadata, self.device)
-
+                # with torch.compiler.disable():
                 rolled_reals_gan_hidden_states = checkpoint(
                     self.discriminator, reals_t_gan, t_gan, cond=rolled_conditioning,
                     cfg_scale=1.0, exit_layer_ix=self.discriminator_dit_layer
                 ).transpose(1, 2)
-                # rolled_reals_gan_hidden_states = rolled_reals_gan_hidden_states[:, :, self.context_size:]
+                rolled_reals_gan_hidden_states = rolled_reals_gan_hidden_states[:, :, self.context_size:]
                 disc_scores_rolled_reals = checkpoint(self.discriminator_head, rolled_reals_gan_hidden_states)
                 contrastive_loss_dis = self.calculate_disc_loss(disc_scores_reals, disc_scores_rolled_reals) * self.contrastive_loss_weight
                 log_dict['train/contrastive_loss_dis'] = contrastive_loss_dis.detach()
@@ -1123,4 +1169,12 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
 
         self.log_dict(log_dict, prog_bar=True, on_step=True)
 
-        return loss
+        # # Periodic cleanup — critical for non-rank-0 GPUs which never run the
+        # # demo callback (where gc.collect + empty_cache normally happen).
+        # if self.global_step % 50 == 0:
+        #     gc.collect()
+        #     torch.cuda.empty_cache()
+
+        # # Detach to drop the autograd graph — PL holds the return value as
+        # # `outputs` until the next batch, keeping the entire graph alive.
+        return loss.detach()

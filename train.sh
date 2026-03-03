@@ -10,7 +10,8 @@ export REPO_ROOT="/home/zachary/code/stable-audio-tools/stable_audio_tools"
 # export MODEL_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/model_configs/txt2audio/sao_short_inpaint_silence_encenc_block_causal.json"
 # export MODEL_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/model_configs/txt2audio/sao_short_inpaint_silence_encenc_postpend.json"
 # export MODEL_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/model_configs/txt2audio/saos_inpaint_silence_encenc_postpend.json"
-export MODEL_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/model_configs/txt2audio/saos_self_forcing_arc.json"
+# export MODEL_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/model_configs/txt2audio/saos_self_forcing_arc.json"
+export MODEL_CONFIG="/home/zachary/code/stable-audio-tools/stable_audio_tools/configs/model_configs/txt2audio/saos_self_forcing_arc_long.json"
 
 # export MODEL_CONFIG="/home/zachary/code/sat-sony/sao_base_model_config.json"
 
@@ -36,13 +37,13 @@ export ENABLE_TORCH_COMPILE="1"
 export USE_CHECKPOINTING="0"
 export USE_LORA='false'
 
-CUDA_VISIBLE_DEVICES=0,1 python train.py \
+CUDA_VISIBLE_DEVICES=0,1,2 python train.py \
         --model-config $MODEL_CONFIG \
         --dataset-config $DATASET_CONFIG \
         --config-file /home/zachary/code/stable-audio-tools/defaults.ini \
         --pretrained-ckpt-path $PRETRAINED_CKPT_PATH \
         --save-dir $SAVE_DIR \
-        --num-workers 128 --strategy ddp_find_unused_parameters_true --accum-batches 1 \
-        --batch-size 64 --checkpoint-every 5000 --precision 16-mixed --name "ossl2_selfforcing" # --use-lora $USE_LORA # --ckpt-path $CKPT_PATH \
+        --num-workers 128 --accum-batches 1 \
+        --batch-size 16 --checkpoint-every 5000 --precision 16-mixed --name "ossl2_selfforcing" # --use-lora $USE_LORA # --ckpt-path $CKPT_PATH \
 
 

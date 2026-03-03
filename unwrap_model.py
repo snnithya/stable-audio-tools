@@ -9,6 +9,7 @@ if __name__ == '__main__':
     args.add_argument('--ckpt-path', type=str, default=None)
     args.add_argument('--name', type=str, default='exported_model')
     args.add_argument('--use-safetensors', action='store_true')
+    args.add_argument('--split-qkv', action='store_true', help='Whether to split qkv projections into separate matrices. Only applies to diffusion_cond models and only if the model was trained with split_qkv on.')
 
     args = args.parse_args()
 
@@ -16,6 +17,11 @@ if __name__ == '__main__':
         model_config = json.load(f)
     
     model = create_model_from_config(model_config)
+    if args.split_qkv:
+        for submodule in model.model.model.transformer.modules():
+                # Perform any necessary operations on submodule
+                if hasattr(submodule, "_split_qkv_projections_for_cache"):
+                    submodule._split_qkv_projections_for_cache()
     
     model_type = model_config.get('model_type', None)
 

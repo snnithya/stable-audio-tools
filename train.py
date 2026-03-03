@@ -25,6 +25,7 @@ class ModelConfigEmbedderCallback(pl.Callback):
         checkpoint["model_config"] = self.model_config
 
 def main():
+    torch.set_float32_matmul_precision('medium')
     torch.multiprocessing.set_sharing_strategy('file_system')
     args = get_all_args()
     seed = args.seed
@@ -160,8 +161,12 @@ def main():
                                         load_full_weights=True)
         else:
             strategy = args.strategy
-    else:
-        strategy = 'ddp_find_unused_parameters_true' if args.num_gpus > 1 else "auto"
+    # else:
+        # if args.num_gpus > 1:
+    from pytorch_lightning.strategies import DDPStrategy
+    strategy = DDPStrategy(find_unused_parameters=True, static_graph=True)
+        # else:
+        #     strategy = "auto"
 
     val_args = {}
     
