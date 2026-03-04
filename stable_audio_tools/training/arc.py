@@ -22,7 +22,7 @@ def euler_step(x_t, v_t, t, s):
     return x_t + (s - t)[:, None, None] * v_t
 
 @torch.no_grad()
-def sample_flow_dpmpp_w_intermediates(model, x, sigmas=None, steps=None, callback=None, dist_shift=None, **extra_args):
+def sample_flow_dpmpp_w_intermediates(model, x, sigmas=None, steps=None, callback=None, dist_shift=None, inpaint_masked_input=None, inpaint_mask=None, **extra_args):
     """Draws samples from a model given starting noise. DPM-Solver++ for RF models. Return output at each step."""
 
     assert steps is not None or sigmas is not None, "Either steps or sigmas must be provided"
@@ -48,6 +48,9 @@ def sample_flow_dpmpp_w_intermediates(model, x, sigmas=None, steps=None, callbac
     inters_t = []
 
     for i in range(len(t) - 1):
+        if inpaint_masked_input is not None and inpaint_mask is not None:
+            noised_masked_input = inpaint_masked_input * (1-t[i]) + torch.randn_like(inpaint_masked_input) * t[i]
+            x = x * (1 - inpaint_mask) + noised_masked_input * inpaint_mask
         inters_x.append(x)
         inters_t.append(t[i])
         denoised = x - t[i] * model(x, t[i] * ts, **extra_args)
@@ -64,6 +67,9 @@ def sample_flow_dpmpp_w_intermediates(model, x, sigmas=None, steps=None, callbac
             denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
             x = (t_next / t_curr) * x - alpha_t * (-h).expm1() * denoised_d
         old_denoised = denoised
+
+    if inpaint_masked_input is not None and inpaint_mask is not None:
+        x = x * (1 - inpaint_mask) + inpaint_masked_input * inpaint_mask
     target = x.detach()
     inters_x = torch.stack(inters_x).detach() # steps x B x C x T
     inters_t = torch.stack(inters_t).unsqueeze(-1).detach() # steps x 1
@@ -135,6 +141,7 @@ class ARCTrainingWrapper(pl.LightningModule):
         self.dis_noise_dist = self.build_noise_dist('discriminator')
 
         self.discriminator_config = arc_config.get('discriminator', {})
+        self.grad_penalty_weight = self.discriminator_config.get('grad_penalty_weight', 1.0)
 
         self.discriminator_dit_layer = self.discriminator_config.get('dit_hidden_layer', None)
 
@@ -190,6 +197,16 @@ class ARCTrainingWrapper(pl.LightningModule):
             self.inpaint_mask_kwargs = self.inpainting_config.get("mask_kwargs", {})
             self.ode_inpaint_mask = None
             self.ode_inpaint_masked_input = None
+            print(f"Inpainting mask kwargs: {self.inpaint_mask_kwargs}")
+            if "outpainting_dropout_probs" in self.inpaint_mask_kwargs:
+                # load in silence tensors
+                self.silence_mean = torch.load("/home/zachary/code/stable-audio-tools/notebooks/mean_silence.pt", map_location="cpu")
+                self.silence_scale = torch.load("/home/zachary/code/stable-audio-tools/notebooks/scale_silence.pt", map_location="cpu")
+                self.silence_mean = self.silence_mean.to(self.device)
+                self.silence_scale = self.silence_scale.to(self.device)
+            else:
+                self.silence_mean = None
+                self.silence_scale = None
 
         # Validation
 
@@ -229,7 +246,7 @@ class ARCTrainingWrapper(pl.LightningModule):
 
             if self.inpainting_config is not None:
                 # Create a mask of random length for a random slice of the input
-                inpaint_masked_input, inpaint_mask = random_inpaint_mask(diffusion_input, padding_masks=padding_masks, **self.inpaint_mask_kwargs)
+                inpaint_masked_input, inpaint_mask = random_inpaint_mask(diffusion_input, padding_masks=padding_masks, **self.inpaint_mask_kwargs, silence_mean=self.silence_mean, silence_scale=self.silence_scale)
 
                 teacher_conditioning['inpaint_mask'] = [inpaint_mask]
                 teacher_conditioning['inpaint_masked_input'] = [inpaint_masked_input]
@@ -237,13 +254,25 @@ class ARCTrainingWrapper(pl.LightningModule):
                 self.ode_inpaint_mask = inpaint_mask
                 self.ode_inpaint_masked_input = inpaint_masked_input
 
+                if hasattr(self, "_get_block_mask"):
+                    self.ode_block_mask = self._get_block_mask(diffusion_input.device)
+                    self.ode_enc_enc = 1 - inpaint_mask
+
             logsnr = torch.linspace(-6, 2, self.ode_n_sampling_steps + 1)
             t = torch.sigmoid(-logsnr)
             t[0] = 1
             t[-1] = 0
 
             self.ode_metadata = metadata
-            self.diff_states = sample_flow_dpmpp_w_intermediates(self.teacher_model, start_noise, sigmas=t, cond=teacher_conditioning, cfg_scale=self.ode_warmup_cfg, dist_shift=self.teacher_model.dist_shift, batch_cfg=True)
+            self.diff_states = sample_flow_dpmpp_w_intermediates(
+                self.teacher_model, start_noise, sigmas=t, cond=teacher_conditioning, 
+                cfg_scale=self.ode_warmup_cfg, dist_shift=self.teacher_model.dist_shift, batch_cfg=True, 
+                inpaint_masked_input=inpaint_masked_input if self.inpainting_config is not None else None,
+                inpaint_mask=inpaint_mask if self.inpainting_config is not None else None,
+                enc_enc_mask=self.ode_enc_enc if self.inpainting_config is not None and hasattr(self, "_get_block_mask") else None,
+                self_attention_block_mask=self.ode_block_mask if self.inpainting_config is not None and hasattr(self, "_get_block_mask") else None
+
+            )
 
         conditioning = self.diffusion.conditioner(self.ode_metadata, self.device)
 
@@ -258,7 +287,10 @@ class ARCTrainingWrapper(pl.LightningModule):
         t = t.to(self.device).detach().clone().requires_grad_(False)
         x_t = x_t.to(self.device).detach().clone().requires_grad_(False)
 
-        v_t_student = self.diffusion(x_t, t, cond=conditioning, cfg_dropout_prob=self.cfg_dropout_prob)
+        v_t_student = self.diffusion(x_t, t, cond=conditioning, cfg_dropout_prob=self.cfg_dropout_prob,
+            enc_enc_mask=self.ode_enc_enc if self.inpainting_config is not None and hasattr(self, "_get_block_mask") else None,
+            self_attention_block_mask=self.ode_block_mask if self.inpainting_config is not None and hasattr(self, "_get_block_mask") else None
+        )
         denoised_student = euler_step(x_t, v_t_student, t, torch.zeros_like(t))
         ode_mse_loss = F.mse_loss(denoised_student, self.diff_states['target'])
 
@@ -969,9 +1001,12 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
 
         diffusion_input = reals
 
-        padding_masks = torch.stack(
-            [md["padding_mask"][0] for md in metadata], dim=0
-        ).to(self.device)
+        # Check for wrapped padding masks to avoid interpolation error
+        first_padding_mask = metadata[0]["padding_mask"]
+        if isinstance(first_padding_mask, list) and len(first_padding_mask) == 1:
+            padding_masks = torch.stack([md["padding_mask"][0] for md in metadata], dim=0).to(self.device) # Shape (batch_size, sequence_length)
+        else:
+            padding_masks = torch.stack([md["padding_mask"] for md in metadata], dim=0).to(self.device) # Shape (batch_size, sequence_length)
 
         if self.diffusion.pretransform is not None:
             self.diffusion.pretransform.to(self.device)
@@ -997,6 +1032,27 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
             sched_gen = sched_disc = None
 
         log_dict = {}
+
+        if self.global_step < self.ode_warmup_steps:
+            diffusion_input = diffusion_input[..., :self.context_size + self.chunk_size]
+            ode_mse_loss = self.ode_warmup_step(diffusion_input, metadata, padding_masks[..., :self.context_size + self.chunk_size])
+
+            opt_gen.zero_grad()
+            self.manual_backward(ode_mse_loss)
+            if self.clip_grad_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(self.diffusion.parameters(), self.clip_grad_norm)
+            opt_gen.step()
+
+            if sched_gen is not None:
+                sched_gen.step()
+
+            log_dict = {'train/ode_mse_loss': ode_mse_loss.detach()}
+            self.log_dict(log_dict, prog_bar=True, on_step=True)
+
+            if self.diffusion_ema is not None:
+                self.diffusion_ema.update()
+
+            return ode_mse_loss.detach()
 
         conditioning = self.diffusion.conditioner(metadata, self.device)
 
@@ -1106,6 +1162,8 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
                     noised_denoised_t_gan, t_gan, cond=disc_conditioning,
                     cfg_scale=1.0, exit_layer_ix=self.discriminator_dit_layer, use_checkpointing=False
                 ).transpose(1, 2)
+                noised_reals_gan_hidden_states = noised_reals_gan_hidden_states[:, :, self.context_size:]
+                noised_denoised_gan_hidden_states = noised_denoised_gan_hidden_states[:, :, self.context_size:]
                 disc_scores_noised_reals = checkpoint(self.discriminator_head, noised_reals_gan_hidden_states)
                 disc_scores_noised_denoised = checkpoint(self.discriminator_head, noised_denoised_gan_hidden_states)
                 r1_diff = disc_scores_noised_reals - disc_scores_reals
@@ -1114,7 +1172,7 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
                 r2_penalty = torch.sum(r2_diff ** 2, dim=[1, 2])
                 log_dict['r1_penalty'] = r1_penalty.mean().detach()
                 log_dict['r2_penalty'] = r2_penalty.mean().detach()
-                grad_penalty_loss = (r1_penalty.mean() + r2_penalty.mean()) / 2
+                grad_penalty_loss = (r1_penalty.mean() + r2_penalty.mean()) / 2 * self.grad_penalty_weight
                 log_dict['train/grad_penalty_loss'] = grad_penalty_loss.detach()
             else:
                 grad_penalty_loss = torch.tensor(0.0, device=self.device)

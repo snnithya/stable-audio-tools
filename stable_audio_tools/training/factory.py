@@ -3,6 +3,7 @@ import json
 import torch
 from torch.nn import Parameter
 from ..models.factory import create_model_from_config
+from ..models.utils import copy_state_dict, load_ckpt_state_dict
 
 def create_training_wrapper_from_config(model_config, model):
     model_type = model_config.get('model_type', None)
@@ -73,13 +74,17 @@ def create_training_wrapper_from_config(model_config, model):
             if teacher_model_config is None and arc_config.get("use_model_as_teacher", False):
                 teacher_model_config = model_config
 
+            if type(teacher_model_config) == str:
+                # its a path, load it!
+                teacher_model_config = json.load(open(teacher_model_config))
+
             if teacher_model_config is not None:
                 teacher_model = create_model_from_config(teacher_model_config)
                 teacher_model = teacher_model.eval().requires_grad_(False)
 
                 teacher_model_ckpt = arc_config.get("teacher_model_ckpt", None)
                 if teacher_model_ckpt is not None:
-                    teacher_model.load_state_dict(torch.load(teacher_model_ckpt, weights_only=True)["state_dict"], strict=False)
+                    copy_state_dict(teacher_model, load_ckpt_state_dict(teacher_model_ckpt))
                 else:
                     raise ValueError("teacher_model_ckpt must be specified if teacher_model is specified")
             else:

@@ -103,7 +103,7 @@
                 "enc_enc_attention_pattern": "enc-dec",
                 "outpainting_dropout_probs":
                     {
-                        "p_uncond": 0.1,
+                        "p_uncond": 0.25,
                         "p_partial": 0.1
                     }
             }
@@ -147,7 +147,8 @@
                     "loss_type": "relativistic"
                 },
                 "contrastive": true,
-                "include_grad_penalties": false
+                "include_grad_penalties": true,
+                "grad_penalty_weight": 100.0
             }
         },
         "optimizer_configs": {
