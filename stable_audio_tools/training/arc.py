@@ -865,12 +865,13 @@ class SelfForcingARCTrainingWrapper(ARCTrainingWrapper):
 
             # Slide window for next chunk: detach for the next chunk's context
             # New inpaint_input: shift left by chunk_size, append zeros for next generation region
-            inpaint_input = inpaint_input.detach().clone()
-            inpaint_input[:, :, -self.chunk_size:] = chunk.detach()
-            inpaint_input = torch.cat([
-                inpaint_input[:, :, self.chunk_size:],
-                torch.zeros(B, C, self.chunk_size, device=device, dtype=diffusion_input.dtype)
-            ], dim=2)
+            with torch.no_grad():
+                inpaint_input = inpaint_input.detach()
+                inpaint_input[:, :, -self.chunk_size:] = chunk.detach()
+                inpaint_input = torch.cat([
+                    inpaint_input[:, :, self.chunk_size:],
+                    torch.zeros(B, C, self.chunk_size, device=device, dtype=diffusion_input.dtype)
+                ], dim=2)
 
         # Clear KV cache after rollout to free GPU memory
         if self.use_kv_cache:

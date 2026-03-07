@@ -146,7 +146,8 @@ def create_training_wrapper_from_config(model_config, model):
             timestep_sampler_options = training_config.get("timestep_sampler_options", {}),
             p_one_shot=training_config.get("p_one_shot", 0.0),
             inpainting_config = training_config.get("inpainting", None),
-            enc_enc = training_config.get("enc_enc", False)
+            enc_enc = training_config.get("enc_enc", False),
+            encoder_seq_len = training_config.get("inpainting", {}).get("mask_kwargs", {}).get("fixed_mask_size", None)
         )
     elif model_type == 'diffusion_autoencoder':
         from .diffusion import DiffusionAutoencoderTrainingWrapper

@@ -30,6 +30,7 @@ class DiffusionTransformer(nn.Module):
         diffusion_objective: tp.Literal["v", "rectified_flow", "rf_denoiser"] = "v",
         postpend=False,
         split_qkv=False,
+        encoder_seq_len=None,
         **kwargs):
 
         super().__init__()
@@ -38,6 +39,7 @@ class DiffusionTransformer(nn.Module):
 
         # Timestep embeddings
         self.timestep_cond_type = timestep_cond_type
+        self.encoder_seq_len = encoder_seq_len
 
         timestep_features_dim = 256
 
@@ -237,8 +239,8 @@ class DiffusionTransformer(nn.Module):
         # Prefill: if KV cache exists but not yet initialized, run encoder-only pass to populate it.
         # This lets all N denoising steps use fast decoder-only flash attention instead of flex attention.
         if use_kv_cache and kv_cache is not None and not kv_cache.get('initialized', False) and prefill:
-            enc_seq_len_prefill = 208
-            kv_cache['encoder_seq_len'] = 208 #TODO hardcoded for now, need to figure out a good way to determine this dynamically based on the enc_enc_mask or input length but not trigger graph recompilation
+            enc_seq_len_prefill = self.encoder_seq_len
+            kv_cache['encoder_seq_len'] = enc_seq_len_prefill
             if enc_seq_len_prefill is not None and enc_seq_len_prefill > 0:
                 x_enc = x[:, :enc_seq_len_prefill]
                 add_emb_enc = add_emb[:, :enc_seq_len_prefill] if add_emb is not None else None

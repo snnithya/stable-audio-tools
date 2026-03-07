@@ -695,13 +695,14 @@ class Attention(nn.Module):
 
         # Populate cache on first pass (after RoPE has been applied)
         if using_cache and not self.has_cache():
-            if is_cross_attn:
-                # Cache entire cross-attention K,V
-                self.set_cache(k, v)
-            else:
-                # Cache encoder portion of self-attention K,V
-                if encoder_seq_len is not None and encoder_seq_len > 0:
-                    self.set_cache(k[:, :, :encoder_seq_len], v[:, :, :encoder_seq_len])
+            with torch.no_grad():
+                if is_cross_attn:
+                    # Cache entire cross-attention K,V
+                    self.set_cache(k, v)
+                else:
+                    # Cache encoder portion of self-attention K,V
+                    if encoder_seq_len is not None and encoder_seq_len > 0:
+                        self.set_cache(k[:, :, :encoder_seq_len], v[:, :, :encoder_seq_len])
 
         n, device = q.shape[-2], q.device
 
