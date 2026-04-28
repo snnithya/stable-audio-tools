@@ -127,7 +127,9 @@ def sample_discrete_euler(model, x, steps=None, sigma_max=1, sigmas=None, callba
         )
 
         dt = t_prev - t_curr  # we solve backwards in our formulation
-
+        # print('t_curr_tensor', t_curr_tensor.shape, t_curr_tensor.device)
+        # print('x', x.shape, x.device)
+        # print('extra_args', extra_args)
         v = model(x, t_curr_tensor, **extra_args)
         x = x + dt * v
 

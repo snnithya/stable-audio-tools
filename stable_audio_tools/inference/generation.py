@@ -9,6 +9,9 @@ from .utils import prepare_audio
 from .sampling import sample, sample_k, sample_rf
 from ..data.utils import PadCrop
 from torch.nn.attention.flex_attention import create_block_mask, or_masks
+from stable_audio_tools.inference.utils import prepare_audio
+from stable_audio_tools.inference.sampling import sample_discrete_euler
+import copy
 
 def generate_diffusion_uncond(
         model,
@@ -709,3 +712,430 @@ def build_mask(sample_size, mask_args):
         mask = mask * (1-marination) 
     #print(mask)
     return mask
+
+def generate_diffusion_flowedit(
+        model,
+        steps: int = 250,
+        src_cfg_scale=6,
+        tar_cfg_scale=6,
+        src_conditioning_tensors: tp.Optional[dict] = None,
+        tar_conditioning_tensors: tp.Optional[dict] = None,
+        n_avg: int = 1,
+        batch_size: int = 1,
+        sample_size: int = 2097152,
+        sample_rate: int = 48000,
+        seed: int = -1,
+        device: str = "cuda",
+        init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
+        init_noise_level: float = 1.0,
+        return_latents = False,
+        
+        **sampler_kwargs
+        ) -> torch.Tensor: 
+    """
+    Generate audio from a prompt using a diffusion model.
+    
+    Args:
+        model: The diffusion model to use for generation.
+        steps: The number of diffusion steps to use.
+        cfg_scale: Classifier-free guidance scale 
+        conditioning: A dictionary of conditioning parameters to use for generation.
+        conditioning_tensors: A dictionary of precomputed conditioning tensors to use for generation.
+        batch_size: The batch size to use for generation.
+        sample_size: The length of the audio to generate, in samples.
+        sample_rate: The sample rate of the audio to generate (Deprecated, now pulled from the model directly)
+        seed: The random seed to use for generation, or -1 to use a random seed.
+        device: The device to use for generation.
+        init_audio: A tuple of (sample_rate, audio) to use as the initial audio for generation.
+        init_noise_level: The noise level to use when generating from an initial audio sample.
+        return_latents: Whether to return the latents used for generation instead of the decoded audio.
+        **sampler_kwargs: Additional keyword arguments to pass to the sampler.    
+    """
+
+    # The length of the output in audio samples 
+    audio_sample_size = sample_size
+
+    # If this is latent diffusion, change sample_size instead to the downsampled latent size
+    if model.pretransform is not None:
+        sample_size = sample_size // model.pretransform.downsampling_ratio
+        
+    # Seed
+    # The user can explicitly set the seed to deterministically generate the same output. Otherwise, use a random seed.
+    seed = seed if seed != -1 else np.random.randint(0, 2**32 - 1)
+    print(seed)
+    torch.manual_seed(seed)
+    # Define the initial noise immediately after setting the seed
+    noise = torch.randn([batch_size, model.io_channels, sample_size], device=device)
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cudnn.benchmark = False
+
+    # Conditioning
+    assert src_conditioning_tensors is not None, "Must provide src_conditioning_tensors"
+    assert tar_conditioning_tensors is not None, "Must provide tar_conditioning_tensors"
+    src_conditioning_inputs = model.get_conditioning_inputs(src_conditioning_tensors)
+    for k, v in src_conditioning_inputs.items():
+        if isinstance(v, torch.Tensor):
+            print(k, v.shape)
+        else:
+            print(k, v)
+    tar_conditioning_inputs = model.get_conditioning_inputs(tar_conditioning_tensors)
+    if init_audio is not None:
+        # The user supplied some initial audio (for inpainting or variation). Let us prepare the input audio.
+        in_sr, init_audio = init_audio
+
+        io_channels = model.io_channels
+
+        # For latent models, set the io_channels to the autoencoder's io_channels
+        if model.pretransform is not None:
+            io_channels = model.pretransform.io_channels
+
+        # Prepare the initial audio for use by the model
+        init_audio = prepare_audio(init_audio, in_sr=in_sr, target_sr=model.sample_rate, target_length=audio_sample_size, target_channels=io_channels, device=device)
+
+        # For latent models, encode the initial audio into latents
+        if model.pretransform is not None:
+            init_audio = model.pretransform.encode(init_audio)
+
+        init_audio = init_audio.repeat(batch_size, 1, 1)
+
+        sampler_kwargs["sigma_max"] = init_noise_level
+
+    model_dtype = next(model.model.parameters()).dtype
+    noise = noise.type(model_dtype)
+    src_conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in src_conditioning_inputs.items()}
+    tar_conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in tar_conditioning_inputs.items()}
+
+    z_t_fe = init_audio.clone()
+    init_audio = init_audio.unsqueeze(0).repeat(n_avg, 1, 1, 1) # (n_avg, batch_size, channels, length)??
+    z_t_fe = z_t_fe.unsqueeze(0).repeat(n_avg, 1, 1, 1) # (n_avg, batch_size, channels, length)??
+    print('z_t_fe.shape', z_t_fe.shape)
+
+    for i in np.linspace(1, 0, steps+1)[:-1]:
+        print('i', i)
+        t = torch.Tensor([i]).repeat(n_avg).to(device)
+        noise = torch.randn_like(z_t_fe).to(device)
+        z_t_src = (1 - i) * init_audio + i * noise
+        print('z_t_src.shape', z_t_src.shape, z_t_src.device)
+   
+        z_t_tar = z_t_fe + z_t_src - init_audio
+        # z_t_tar = z_t_tar.view(-1, *z_t_tar.shape[2:]) # (n_avg * batch_size, channels, length)
+        print('z_t_tar.shape', z_t_tar.shape, z_t_tar.device)
+
+        z_t_src = z_t_src.view(-1, *z_t_src.shape[2:]) # (n_avg * batch_size, channels, length)
+        z_t_tar = z_t_tar.view(-1, *z_t_tar.shape[2:]) # (n_avg * batch_size, channels, length)
+
+        v_tar = model.model(z_t_tar, t, **tar_conditioning_inputs, cfg_scale=tar_cfg_scale)
+        v_src = model.model(z_t_src, t, **src_conditioning_inputs, cfg_scale=src_cfg_scale)
+        v_delta = v_tar - v_src
+
+        v_delta = v_delta.view(n_avg, batch_size, *v_delta.shape[1:])
+        v_delta = v_delta.mean(0, keepdim=True) # (1, batch_size, channels, length)
+        print('v_delta.shape', v_delta.shape)
+        z_t_fe = z_t_fe - v_delta/steps
+        print('z_t_fe.shape', z_t_fe.shape)
+    
+    z_t_fe = z_t_fe[0]  # (batch_size, channels, length), all elements along first dim should be the same
+
+    del noise
+    del src_conditioning_tensors
+    del tar_conditioning_tensors
+    torch.cuda.empty_cache()
+    # Denoising process done. 
+    # If this is latent diffusion, decode latents back into audio
+    if model.pretransform is not None and not return_latents:
+        #cast sampled latents to pretransform dtype
+        sampled = z_t_fe.to(next(model.pretransform.parameters()).dtype)
+        sampled = model.pretransform.decode(sampled)
+
+    # Return audio
+    return sampled
+
+def generate_diffusion_inversion(
+        model,
+        steps: int = 250,
+        src_cfg_scale=6,
+        tar_cfg_scale=6,
+        src_conditioning_tensors: tp.Optional[dict] = None,
+        tar_conditioning_tensors: tp.Optional[dict] = None,
+        batch_size: int = 1,
+        sample_size: int = 2097152,
+        sample_rate: int = 48000,
+        seed: int = -1,
+        device: str = "cuda",
+        init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
+        init_noise_level: float = 1.0,
+        return_latents = False,
+        
+        **sampler_kwargs
+        ) -> torch.Tensor: 
+    """
+    Generate audio from a prompt using a diffusion model.
+    
+    Args:
+        model: The diffusion model to use for generation.
+        steps: The number of diffusion steps to use.
+        cfg_scale: Classifier-free guidance scale 
+        conditioning: A dictionary of conditioning parameters to use for generation.
+        conditioning_tensors: A dictionary of precomputed conditioning tensors to use for generation.
+        batch_size: The batch size to use for generation.
+        sample_size: The length of the audio to generate, in samples.
+        sample_rate: The sample rate of the audio to generate (Deprecated, now pulled from the model directly)
+        seed: The random seed to use for generation, or -1 to use a random seed.
+        device: The device to use for generation.
+        init_audio: A tuple of (sample_rate, audio) to use as the initial audio for generation.
+        init_noise_level: The noise level to use when generating from an initial audio sample.
+        return_latents: Whether to return the latents used for generation instead of the decoded audio.
+        **sampler_kwargs: Additional keyword arguments to pass to the sampler.    
+    """
+
+    # The length of the output in audio samples 
+    audio_sample_size = sample_size
+
+    # If this is latent diffusion, change sample_size instead to the downsampled latent size
+    if model.pretransform is not None:
+        sample_size = sample_size // model.pretransform.downsampling_ratio
+        
+    # Seed
+    # The user can explicitly set the seed to deterministically generate the same output. Otherwise, use a random seed.
+    seed = seed if seed != -1 else np.random.randint(0, 2**32 - 1)
+    print(seed)
+    torch.manual_seed(seed)
+    # Define the initial noise immediately after setting the seed
+    noise = torch.randn([batch_size, model.io_channels, sample_size], device=device)
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cudnn.benchmark = False
+
+    # Conditioning
+    assert src_conditioning_tensors is not None, "Must provide src_conditioning_tensors"
+    assert tar_conditioning_tensors is not None, "Must provide tar_conditioning_tensors"
+    src_conditioning_inputs = model.get_conditioning_inputs(src_conditioning_tensors)
+    tar_conditioning_inputs = model.get_conditioning_inputs(tar_conditioning_tensors)
+    if init_audio is not None:
+        # The user supplied some initial audio (for inpainting or variation). Let us prepare the input audio.
+        in_sr, init_audio = init_audio
+
+        io_channels = model.io_channels
+
+        # For latent models, set the io_channels to the autoencoder's io_channels
+        if model.pretransform is not None:
+            io_channels = model.pretransform.io_channels
+
+        # Prepare the initial audio for use by the model
+        init_audio = prepare_audio(init_audio, in_sr=in_sr, target_sr=model.sample_rate, target_length=audio_sample_size, target_channels=io_channels, device=device)
+
+        # For latent models, encode the initial audio into latents
+        if model.pretransform is not None:
+            init_audio = model.pretransform.encode(init_audio)
+
+        init_audio = init_audio.repeat(batch_size, 1, 1)
+        print(init_audio.shape)
+        sampler_kwargs["sigma_max"] = init_noise_level
+
+    model_dtype = next(model.model.parameters()).dtype
+    src_conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in src_conditioning_inputs.items()}
+    tar_conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in tar_conditioning_inputs.items()}
+
+    ts = torch.linspace(0, 1, steps+1).to(device)
+    inverse = sample_discrete_euler(model.model, init_audio, steps=steps, sigmas=ts[:-1],  **src_conditioning_inputs, cfg_scale=src_cfg_scale)
+    print(inverse.shape)
+    sampled = sample_discrete_euler(model.model, inverse, steps=steps, sigmas=ts.flip(0)[:-1], **tar_conditioning_inputs, cfg_scale=tar_cfg_scale)
+    print(sampled.shape)
+
+    del src_conditioning_tensors
+    del tar_conditioning_tensors
+    torch.cuda.empty_cache()
+    # Denoising process done. 
+    # If this is latent diffusion, decode latents back into audio
+    if model.pretransform is not None and not return_latents:
+        #cast sampled latents to pretransform dtype
+        sampled = sampled.to(next(model.pretransform.parameters()).dtype)
+        sampled = model.pretransform.decode(sampled)
+
+    # Return audio
+    return sampled
+
+def generate_diffusion_latent_flowedit(
+        model,
+        src_inv_cfg_scale=6,
+        tar_inv_cfg_scale=6,
+        src_lfe_cfg_scale=6,
+        tar_lfe_cfg_scale=6,
+        src_conditioning_tensors: tp.Optional[dict] = None,
+        tar_conditioning_tensors: tp.Optional[dict] = None,
+        n_avg: int = 1,
+        batch_size: int = 1,
+        sample_size: int = 2097152,
+        # sample_rate: int = 48000,
+        seed: int = -1,
+        device: str = "cuda",
+        init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
+        init_noise_level: float = 1.0,
+        return_latents = False,
+        deterministic_inverse = False,
+        noise_amt = 1.0,
+        inv_steps = 10,
+        lfe_steps = 10,
+        return_intermediate_latents = False,
+        intermediate_latents_interval = 5,
+        **sampler_kwargs
+        ) -> torch.Tensor: 
+    """
+    Generate audio from a prompt using a diffusion model.
+    
+    Args:
+        model: The diffusion model to use for generation.
+        steps: The number of diffusion steps to use.
+        cfg_scale: Classifier-free guidance scale 
+        conditioning: A dictionary of conditioning parameters to use for generation.
+        conditioning_tensors: A dictionary of precomputed conditioning tensors to use for generation.
+        batch_size: The batch size to use for generation.
+        sample_size: The length of the audio to generate, in samples.
+        sample_rate: The sample rate of the audio to generate (Deprecated, now pulled from the model directly)
+        seed: The random seed to use for generation, or -1 to use a random seed.
+        device: The device to use for generation.
+        init_audio: A tuple of (sample_rate, audio) to use as the initial audio for generation.
+        init_noise_level: The noise level to use when generating from an initial audio sample.
+        return_latents: Whether to return the latents used for generation instead of the decoded audio.
+        **sampler_kwargs: Additional keyword arguments to pass to the sampler.    
+    """
+
+    # The length of the output in audio samples 
+    audio_sample_size = sample_size
+
+    # If this is latent diffusion, change sample_size instead to the downsampled latent size
+    if model.pretransform is not None:
+        sample_size = sample_size // model.pretransform.downsampling_ratio
+        
+    # Seed
+    # The user can explicitly set the seed to deterministically generate the same output. Otherwise, use a random seed.
+    seed = seed if seed != -1 else np.random.randint(0, 2**32 - 1)
+    # print(seed)
+    torch.manual_seed(seed)
+    # Define the initial noise immediately after setting the seed
+    noise = torch.randn([batch_size, model.io_channels, sample_size], device=device)
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cudnn.benchmark = False
+
+    # Conditioning
+    assert src_conditioning_tensors is not None, "Must provide src_conditioning_tensors"
+    assert tar_conditioning_tensors is not None, "Must provide tar_conditioning_tensors"
+    src_conditioning_inputs = model.get_conditioning_inputs(src_conditioning_tensors)
+    tar_conditioning_inputs = model.get_conditioning_inputs(tar_conditioning_tensors)
+    if init_audio is not None:
+        # The user supplied some initial audio (for inpainting or variation). Let us prepare the input audio.
+        in_sr, init_audio = init_audio
+
+        io_channels = model.io_channels
+
+        # For latent models, set the io_channels to the autoencoder's io_channels
+        if model.pretransform is not None:
+            io_channels = model.pretransform.io_channels
+
+        # Prepare the initial audio for use by the model
+        init_audio = prepare_audio(init_audio, in_sr=in_sr, target_sr=model.sample_rate, target_length=audio_sample_size, target_channels=io_channels, device=device)
+
+        # For latent models, encode the initial audio into latents
+        if model.pretransform is not None:
+            init_audio = model.pretransform.encode(init_audio)
+
+        init_audio = init_audio.repeat(batch_size, 1, 1)
+
+        sampler_kwargs["sigma_max"] = init_noise_level
+
+    model_dtype = next(model.model.parameters()).dtype
+    noise = noise.type(model_dtype)
+    src_conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in src_conditioning_inputs.items()}
+    src_conditioning_inputs_lfe = {k: v.expand(n_avg, *v.shape[1:]).type(model_dtype) if v is not None else v for k, v in src_conditioning_inputs.items()} # allowing batch processing of lfe
+    tar_conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in tar_conditioning_inputs.items()}
+    tar_conditioning_inputs_lfe = {k: v.expand(n_avg, *v.shape[1:]).type(model_dtype) if v is not None else v for k, v in tar_conditioning_inputs.items()} # allowing batch processing of latent flowedit
+    intermediate_latents = []
+    if inv_steps > 0 and noise_amt > 0:
+        ts = torch.linspace(0, noise_amt, inv_steps+1).to(device)
+    else:
+        ts = None
+        
+    # inverse
+    if ts is not None:
+        # print('in inverse')
+        if deterministic_inverse:
+            # print('deterministic inverse')
+            z_t_lfe = sample_discrete_euler(model.model, init_audio, steps=inv_steps, sigmas=ts[:-1], **src_conditioning_inputs, cfg_scale=src_inv_cfg_scale)
+        else:
+            # print('stochastic inverse')
+            z_t_lfe = (1 - noise_amt) * init_audio + noise_amt * noise
+    else:
+        z_t_lfe = init_audio
+    
+    if lfe_steps > 0 and noise_amt < 1:
+        # print('in latent flowedit')
+        # latent flowedit
+        inv = z_t_lfe.clone().unsqueeze(0)
+        z_t_lfe = z_t_lfe.unsqueeze(0).repeat(n_avg, 1, 1, 1) # (n_avg, batch_size, channels, length)??
+        # print('z_t_lfe.shape', z_t_lfe.shape)
+        
+        for ind, i in enumerate(np.linspace(1, 0, lfe_steps+1)[:-1]):
+            t = torch.Tensor([i]).repeat(n_avg).to(device)
+            noise = torch.randn_like(z_t_lfe).to(device)
+            z_t_src = (1 - i) * init_audio + i * noise
+    
+            z_t_tar = (z_t_lfe - inv) / (1 - noise_amt) + z_t_src
+            # z_t_tar = z_t_tar.view(-1, *z_t_tar.shape[2:]) # (n_avg * batch_size, channels, length)
+
+            z_t_src = z_t_src.view(-1, *z_t_src.shape[2:]) # (n_avg * batch_size, channels, length)
+            z_t_tar = z_t_tar.view(-1, *z_t_tar.shape[2:]) # (n_avg * batch_size, channels, length)
+
+            v_tar = model.model(z_t_tar, t, **tar_conditioning_inputs_lfe, cfg_scale=tar_lfe_cfg_scale)
+            v_src = model.model(z_t_src, t, **src_conditioning_inputs_lfe, cfg_scale=src_lfe_cfg_scale)
+            v_delta = v_tar - v_src
+
+            v_delta = v_delta.view(n_avg, batch_size, *v_delta.shape[1:])
+            v_delta = v_delta.mean(0, keepdim=True) # (1, batch_size, channels, length)
+            
+            z_t_lfe = z_t_lfe - v_delta/lfe_steps* (1 - noise_amt)
+            if return_intermediate_latents and ind % intermediate_latents_interval == 0:
+                intermediate_latents.append(z_t_lfe[0].clone())
+        z_t_lfe = z_t_lfe[0]
+    # decode
+    if ts is not None:
+        # print('in decode')
+        sampled = sample_discrete_euler(model.model, z_t_lfe, steps=inv_steps, sigmas=ts.flip(0)[:-1], **tar_conditioning_inputs, cfg_scale=tar_inv_cfg_scale)
+    else:
+        sampled = z_t_lfe
+    intermediate_sampled = []
+    if return_intermediate_latents:
+        ts = torch.linspace(0, 1, lfe_steps+1).to(device)
+        for ind, intermediate_latent in enumerate(intermediate_latents):
+            t_val = ts[ind]
+            mixed_cond = copy.deepcopy(src_conditioning_tensors)
+            mixed_cond['prompt'] = (
+                src_conditioning_tensors['prompt'][0] * (1-t_val) + tar_conditioning_tensors['prompt'][0] * (t_val),
+                src_conditioning_tensors['prompt'][1] & tar_conditioning_tensors['prompt'][1]
+            )
+            lfe_mixed_cond = model.get_conditioning_inputs(mixed_cond)
+            intermediate_latent_val = sample_discrete_euler(model.model, intermediate_latent, steps=inv_steps, sigmas=ts.flip(0)[:-1], **lfe_mixed_cond, cfg_scale=tar_inv_cfg_scale)
+            if model.pretransform is not None:
+                intermediate_latent_val = intermediate_latent_val.to(next(model.pretransform.parameters()).dtype)
+                intermediate_latent_val = model.pretransform.decode(intermediate_latent_val)
+            intermediate_sampled.append(intermediate_latent_val)
+    del noise
+    del src_conditioning_tensors
+    del tar_conditioning_tensors
+    torch.cuda.empty_cache()
+    # Denoising process done. 
+    # If this is latent diffusion, decode latents back into audio
+    if model.pretransform is not None:
+        #cast sampled latents to pretransform dtype
+        sampled = sampled.to(next(model.pretransform.parameters()).dtype)
+        sampled = model.pretransform.decode(sampled)
+
+    # Return audio
+    return sampled, intermediate_sampled
