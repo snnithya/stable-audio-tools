@@ -983,6 +983,7 @@ def generate_diffusion_latent_flowedit(
         lfe_steps = 10,
         return_intermediate_latents = False,
         intermediate_latents_interval = 5,
+        intermediate_latents_steps = None,
         **sampler_kwargs
         ) -> torch.Tensor: 
     """
@@ -1081,6 +1082,7 @@ def generate_diffusion_latent_flowedit(
         inv = z_t_lfe.clone().unsqueeze(0)
         z_t_lfe = z_t_lfe.unsqueeze(0).repeat(n_avg, 1, 1, 1) # (n_avg, batch_size, channels, length)??
         # print('z_t_lfe.shape', z_t_lfe.shape)
+        _capture_steps_set = set(intermediate_latents_steps) if intermediate_latents_steps is not None else None
         
         for ind, i in enumerate(np.linspace(1, 0, lfe_steps+1)[:-1]):
             t = torch.Tensor([i]).repeat(n_avg).to(device)
@@ -1101,8 +1103,14 @@ def generate_diffusion_latent_flowedit(
             v_delta = v_delta.mean(0, keepdim=True) # (1, batch_size, channels, length)
             
             z_t_lfe = z_t_lfe - v_delta/lfe_steps* (1 - noise_amt)
-            if return_intermediate_latents and ind % intermediate_latents_interval == 0:
-                intermediate_latents.append(z_t_lfe[0].clone())
+            if return_intermediate_latents:
+                _capture = (
+                    ind in _capture_steps_set
+                    if _capture_steps_set is not None
+                    else ind % intermediate_latents_interval == 0
+                )
+                if _capture:
+                    intermediate_latents.append(z_t_lfe[0].clone())
         z_t_lfe = z_t_lfe[0]
     # decode
     if ts is not None:
